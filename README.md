@@ -1,42 +1,53 @@
 # Qwen3.8-27B on a single RTX 5090 — a validated, one-click local setup
 
 Runs **Qwen3.8-27B (unsloth NVFP4)** on **vLLM 0.27.1** under WSL2, tuned and measured on a
-desktop RTX 5090 (SM120, 32GB). OpenAI-compatible API with thinking, tool calling, 80K context
-(96K profile included), speculative decoding, and prefix caching.
+desktop RTX 5090 (SM120, 32GB). OpenAI-compatible API with thinking, tool calling, **96K
+context**, MTP speculative decoding, and prefix caching.
 
-Every flag in here exists because something broke without it. The battle log below is the real
-value of this repo: nine problems that each cost hours, already solved.
+Every flag in here exists because something broke without it. The battle log is the real value
+of this repo: a dozen problems that each cost hours, already solved — including one that makes
+the server *silently* 27x slower after a few minutes of use, with no error anywhere.
 
-**Measured on the reference machine** (Ryzen 9 5900X / 32GB RAM / RTX 5090):
+## Measured performance
+
+Reference machine: Ryzen 9 5900X / 32GB RAM / RTX 5090 32GB / Win11 + WSL2 Ubuntu-26.04.
+All numbers from the validation run on 2026-08-18, production config, bare desktop.
 
 | Scenario | Result |
 |---|---|
-| Short coding reply, thinking off | **112–117 tok/s**, first token ~0.15s |
-| Decode with 10K context loaded | **124–126 tok/s** |
-| Deep reasoning, large context | 20–55 tok/s (real envelope on hard work) |
-| Prompt ingest, bare desktop | **~5,300 tok/s** (88K tokens in 19s) |
-| Repeat turn with prefix cache | **0.39s** to first token (vs ~20s cold) |
-| MTP draft acceptance | 90–99% on code, 40–60% on deep reasoning |
-| Long-context accuracy | **8/8 exact needle retrieval at 88K** |
+| Short coding reply, thinking off | **114.5 tok/s** (111.9 / 118.7 / 112.8) |
+| Sustained thinking, 3,000 tokens out | 33.2-33.7s per response |
+| 30K-context reasoning | **131.2 tok/s**, first token 8.98s cold / **3.58s cached** |
+| 4 concurrent streams | 105 tok/s aggregate, 107-120 per stream |
+| 60K-context first token | **7.1-7.8s** (was 210.8s before the MNBT fix — see below) |
+| Decode rate across all reasoning-effort levels | 75-102 tok/s |
+| VRAM stability | flat: 29,520 MiB across a 14-minute varied-load run |
+| **Code accuracy** | **24/24** unit-tested problems |
+| **Tool-call validity** | **3/3** |
+| **Long-context bug-finding** | **2/2** |
+| **Accuracy on prefix-cache-HIT paths** | **18/18**, identical to cold (see vLLM #47861 below) |
 
-For comparison, the same hardware running the previous-gen Qwen3.6-27B (NVIDIA NVFP4 via Docker,
-Marlin kernel path) peaked at 72–77 tok/s. This setup is ~1.5–1.6× faster on a newer model.
+The previous-gen Qwen3.6-27B on the same card (NVIDIA NVFP4 via Docker, Marlin kernel path)
+peaked at 72-77 tok/s. This is ~1.5-1.6x faster on a newer model with 96K context.
 
----
+Kernel check that matters: the boot log must show `FlashInferCutlassNvFp4LinearKernel` — the
+native Blackwell FP4 tensor-core path. If it shows Marlin instead, you are on a weight-only
+fallback and leaving ~40% of the speed on the table.
 
 ## Requirements
 
 - RTX 5090 (or another 32GB Blackwell card), recent NVIDIA driver (610+)
-- Windows 11 with WSL2 available, ~60GB free disk, 32GB system RAM
-- No Docker needed. No Hugging Face account needed (the model is public).
+- Windows 11 with WSL2, ~60GB free disk, 32GB system RAM
+- No Docker. No Hugging Face account (the model is public).
 
 ## Setup (two double-clicks)
 
 1. **`SETUP.bat`** — installs Ubuntu-26.04 under WSL2, sizes `.wslconfig`, installs the pinned
-   Python/CUDA stack, fetches the official chat template, downloads the model (~20GB).
-   Takes 15–40 minutes depending on your connection. Safe to re-run.
-2. **`START-QWEN.bat`** — boots the server. ~5 minutes the first time (compiles kernels, cached
-   afterward), ~2.5 minutes on later boots. Ready when the log shows `Application startup complete`.
+   Python/CUDA stack, fetches the official chat template, downloads the model (~22GB).
+   15-40 minutes depending on your connection. Safe to re-run.
+2. **`START-QWEN.bat`** — boots the server. ~5 minutes the first time (compiles and autotunes
+   kernels, cached afterward), ~2.5 minutes on later boots. Ready when the log shows
+   `Application startup complete`.
 
 Then point any OpenAI-compatible client at:
 
@@ -44,130 +55,374 @@ Then point any OpenAI-compatible client at:
 - **Model:** `qwen3.8-27b`
 - **API key:** auto-generated on first run into `api-key.txt` (unique per machine; delete to rotate)
 
-Stop with `STOP-QWEN.bat`. Closing the server window also stops it. It does **not** auto-start on
-boot by design.
-
-### Optional
-
-- **`START-96K.bat`** — 96K context, single request slot. For whole-repo / huge-document sessions.
-  Requires a bare desktop (see the VRAM rule below).
-- **`REGISTER-MAINTENANCE.bat`** — daily 5am restart that only fires **if the server is already
-  running**. Caps the slow memory growth of the experimental prefix cache. Remove with
-  `schtasks /Delete /TN Qwen38Maintenance`.
-- **`bench.py` / `bench2.py`** — the benchmark harnesses used to produce the numbers above.
-  Run inside WSL: `/opt/qwen38/venv/bin/python bench.py --tag mytest`
-
-## The one rule that matters: keep desktop VRAM low
-
-The server takes ~29–30GB of the card. If desktop apps (Wallpaper Engine, Chrome with hardware
-acceleration, games) hold more than roughly 1.3GB, Windows starts **paging GPU memory** and
-throughput collapses by 10× — while everything still "works," so it reads as a mystery slowdown.
-
-`serve-wsl.sh` measures desktop VRAM before loading the model and prints a loud `PREFLIGHT`
-warning if you are over budget. Check `logs/serve.log` for that line whenever performance feels off.
-To find the culprit: Task Manager → Details tab → add the **Dedicated GPU memory** column → sort.
+Stop with `STOP-QWEN.bat`. Closing the server window also stops it. It does **not** auto-start
+on boot, by design.
 
 ## Client settings (Cline / Roo / Continue / any OpenAI client)
 
 | Setting | Value | Why |
 |---|---|---|
-| Context Window Size | **70000** (80K profile) / 86000 (96K profile) | Client token estimators undercount Qwen's tokenizer; the margin prevents truncated turns |
+| Context Window Size | **86000** | Client token estimators undercount Qwen's tokenizer; the margin below 98,304 prevents truncated turns |
 | Max Output Tokens | **16384** | Thinking shares this budget — starving it truncates turns mid-tool-call |
 | Temperature | **1.0, explicitly set** | Some clients send 0 by default; greedy decoding makes thinking models loop |
-| Reasoning Effort | **medium** | Default is `xhigh` (maximum depth). See the effort section below |
+| Reasoning Effort | **medium** | Default is `xhigh`. See the effort section below — this is the single biggest quality-of-life setting |
 | Auto-condense threshold | **~60%** | Compaction requests are LLM calls too; they fail if the conversation is already huge |
 
-Anything you don't send (top_p / top_k / min_p) falls back to the checkpoint's recommended values
-(0.95 / 20 / 0). The server never overrides client-sent values.
+Anything you don't send (top_p / top_k / min_p) falls back to the checkpoint's recommended
+values (0.95 / 20 / 0). The server never overrides client-sent values; it only fills gaps.
+
+## The locked configuration, and why every flag is there
+
+```
+vllm serve unsloth/Qwen3.8-27B-NVFP4
+  --served-model-name qwen3.8-27b
+  --host 0.0.0.0 --port 8000 --api-key <api-key.txt>
+  --max-model-len 98304                 # 96K context
+  --kv-cache-dtype fp8_e4m3             # halves KV cost; quality-validated (see below)
+  --gpu-memory-utilization 0.90         # ceiling only; the KV pool is pinned explicitly
+  --kv-cache-memory-bytes 5000000000    # 5.0 GB -> 113,624-token pool. THE determinism knob
+  --max-num-seqs 1                      # single-user profile; raise for shared use
+  --max-num-batched-tokens 2048         # THE fix. Was 12288. See "the silent 27x slowdown"
+  --language-model-only                 # drops the vision tower, frees ~1-3GB (coding use)
+  --async-scheduling                    # overlaps CPU scheduling with GPU work
+  --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+  --chat-template chat_template_official.jinja   # reasoning_effort lives in this template
+  --reasoning-parser qwen3              # thinking separated into message.reasoning_content
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder
+  --enable-prefix-caching --mamba-cache-mode align --prefix-match-unit 16
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+```
+
+Every value is an environment variable override, no editing required:
+`CTX`, `KV_DTYPE`, `UTIL`, `KV_BYTES`, `SEQS`, `MNBT`, `SPEC_TOKENS`, `SPEC=0`, `NO_PREFIX=1`,
+`KERNEL_FALLBACK=1`.
+
+Env the script sets for you: `HF_HOME`, `CUDA_HOME` pointing at the venv's cu13,
+`MAX_JOBS=4`, `NVCC_THREADS=2`, persistent FlashInfer-autotune and Triton cache dirs (this is
+what makes warm boots 2.5 min instead of 5), and `VLLM_ENGINE_READY_TIMEOUT_S=1800`.
+
+## The one rule that matters: keep desktop VRAM low
+
+The server takes ~29-30GB of the card. If desktop apps (Wallpaper Engine, Chrome with hardware
+acceleration, games) hold more than roughly 1.3GB, Windows starts **paging GPU memory** and
+throughput collapses by 10x — while everything still "works", so it reads as a mystery slowdown.
+
+`serve-wsl.sh` measures desktop VRAM before loading the model and prints a loud `PREFLIGHT`
+warning if you are over budget. Check `logs/serve.log` for that line whenever performance feels
+off. To find the culprit: Task Manager -> Details tab -> add the **Dedicated GPU memory**
+column -> sort descending.
+
+The script also writes `logs/gpu-watch.csv` every 60 seconds while serving. On a healthy config
+that column is *flat*. If it climbs toward 32,000 MiB, something is oversubscribed — read the
+next section.
 
 ## reasoning_effort: the dial nobody mentions
 
-Qwen3.8 supports `reasoning_effort` with levels **xhigh (default), medium, low** — plus thinking
-off entirely via `chat_template_kwargs: {"enable_thinking": false}`. The mechanism is a single
-instruction injected by the chat template (medium injects nothing — it's the model's natural depth).
+Qwen3.8 supports `reasoning_effort` with levels **xhigh (default), medium, low** — plus
+thinking off entirely via `chat_template_kwargs: {"enable_thinking": false}`. The mechanism is
+a single instruction injected by the official chat template; `medium` injects nothing at all,
+so it is the model's natural depth.
 
-Measured on one hard prompt with an 8K output budget:
+Measured here, two prompts, 9,000-token output budget:
 
-| Effort | Time | Thinking | Outcome |
-|---|---|---|---|
-| xhigh (default) | 103s | 33,500 chars | **hit the cap, no answer produced** |
-| medium | 55s | 9,900 chars | complete answer |
-| low | 47s | 5,400 chars | complete answer |
+| Prompt | Effort | Wall time | Tokens out | Answer produced? |
+|---|---|---|---|---|
+| easy | low | 23.3s | 2,373 | yes |
+| easy | medium | **9.4s** | 908 | yes |
+| easy | xhigh | 12.5s | 985 | yes |
+| hard | low | **73.1s** | 6,705 | yes |
+| hard | medium | 81.7s | 7,564 | yes (most complete) |
+| hard | xhigh | 119.8s | 9,000 | **no — burned the entire budget thinking** |
 
-The default being `xhigh` is why "it thinks forever" is the most common complaint about this model.
-Use medium for agent work; save xhigh for genuinely hard one-off problems. Note that `low` can cost
-more end-to-end in agent loops (faster turns, more retries) — this matches Qwen's own guidance.
+Two things this settles:
 
-This repo passes `--chat-template` with the **official** template (fetched during setup) because
-the effort levels live in it.
+1. **Effort changes token *count*, not token *rate*.** Decode held at 75-102 tok/s at every
+   level. "xhigh is slow" really means "xhigh writes 4x as much".
+2. **The default (`xhigh`) is why the model appears to hang.** On the hard prompt it consumed
+   a 9,000-token budget and emitted zero answer characters. Set `medium` in your client and
+   most "it thinks forever" complaints disappear.
+
+`low` is not reliably faster — on the easy prompt it produced *more* tokens than medium
+(it skips planning and rambles). Use medium as the default; xhigh only for genuinely hard
+one-off problems where you can afford a large output budget.
 
 ---
 
-## Battle log — nine problems, already solved
+# The silent 27x slowdown — root cause and fix
 
-Each of these presents as something else entirely. If you deviate from the pinned setup, this is
-your debugging map.
+This is the finding that justifies the whole repo. Symptom: **the server is fast right after
+boot and progressively collapses over the next 10-15 minutes of real work.** No error, no OOM,
+no warning in any log. `/health` returns 200 the entire time.
+
+## What it looks like
+
+Sustained varied-load run, cycling 1K / 8K / 20K / 40K / 60K contexts, on the old config
+(`--max-num-batched-tokens 12288`):
+
+| Elapsed | Context | tok/s | First token | VRAM |
+|---|---|---|---|---|
+| 0.1 min | 1K | 745 | 5.7s | 30,961 MiB |
+| 2.1 min | 8K | **4.1** | — | 31,236 MiB |
+| 3.7 min | 20K | **5.4** | — | 32,125 MiB |
+| 10.0 min | 40K | 108 | **374.8s** | 32,086 MiB |
+| 13.6 min | 60K | 93 | **210.8s** | 32,092 MiB |
+
+VRAM pinned at 32,1xx MiB out of 32,607 — 98.5% of the card — and stayed there. Six minutes
+to first token on a 40K prompt.
+
+## Why it happens (and why nothing errors)
+
+Two mechanisms stacked:
+
+1. **Peak activation memory scales with `--max-num-batched-tokens`, not with context length.**
+   At 12288 the budget was structurally oversubscribed: 21.2GB weights + 4.5GB KV + 1.8GB CUDA
+   graphs + ~4GB activations + 0.5GB desktop ≈ 32.1GB = the entire card. It fits at boot,
+   because activations are only allocated when a large prefill actually runs.
+2. **WSL2 ignores NVIDIA's "CUDA - Sysmem Fallback Policy".** On native Windows, exceeding VRAM
+   raises an OOM you can see. Under WSL2 the driver silently spills to system RAM instead
+   ([microsoft/WSL#11050](https://github.com/microsoft/WSL/issues/11050)). Everything keeps
+   working, 10-50x slower, over the PCIe bus. **This is why there is no error to find.**
+
+So: any tuning advice that relies on "raise utilization until it OOMs, then back off" is
+actively wrong under WSL2. The OOM never fires. You have to measure.
+
+## The fix
+
+`--max-num-batched-tokens 2048`. Same run, same load pattern:
+
+| Elapsed | Context | First token | VRAM |
+|---|---|---|---|
+| 0.5 min | 40K | 7.76s | 29,629 MiB |
+| 1.8 min | 60K | **7.29s** | 29,517 MiB |
+| 2.4 min | 60K | 7.14s | 29,521 MiB |
+| 3.4 min | 40K | 7.82s | 29,520 MiB |
+| 4.3 min | 8K | 5.97s | 29,520 MiB |
+
+**60K first token: 210.8s -> 7.29s.** VRAM flat within 600 MiB for the whole run, ~2.6GB of
+headroom permanently free. No cost in context, accuracy, or precision — the 24/24 code score
+was measured *on this config*.
+
+The old value came from a real optimization (MNBT 12288 genuinely does raise cold-prefill
+throughput on an idle server). It just wasn't survivable under sustained load on a 32GB card.
+If you have more VRAM, raise it; on a 5090, don't.
+
+## Pin the KV pool, don't let vLLM guess
+
+vLLM sizes the KV pool from whatever VRAM is free at boot. Across boots on this machine that
+produced pools of 85K, 96K, 104K, 109K, 128K and 158K tokens — the same command, different
+results, silently eating the headroom that keeps the config stable.
+
+`--kv-cache-memory-bytes` makes it deterministic. Swept at MNBT 2048, CTX 98304:
+
+| KV bytes | Pool (tokens) | VRAM at boot | VRAM peak | Free floor | Cached TTFT |
+|---|---|---|---|---|---|
+| 4.4 GB | 99,580 | 27,873 | 29,375 | 3,232 MiB | 4.21s |
+| **5.0 GB** | **113,624** | **28,514** | **30,006** | **2,601 MiB** | **4.18s** |
+| 5.6 GB | 127,667 | 29,044 | 30,514 | 2,093 MiB | 6.10s |
+| 6.2 GB | 141,710 | 29,610 | 30,862 | 1,745 MiB | 9.12s |
+
+(The sweep also logged a cold-prefill TTFT column, but it read 0s on three of the four runs —
+the harness misses TTFT when the first chunk arrives inside its sampling interval. It is
+omitted here rather than reported; the decision rests on the free floor and the cached TTFT,
+both of which were measured cleanly on every run.)
+
+5.0 GB is the knee. Below it you buy nothing measurable; above it the free floor drops under
+~2.1GB and cached latency degrades monotonically (4.18s -> 6.10s -> 9.12s) — the same paging mechanism, just arriving later. The 113,624-token
+pool comfortably exceeds the 98,304 context window, and that surplus is what powers prefix
+caching (4.18s cached vs 8.98s cold at 30K).
+
+Boot is now reproducible: `GPU KV cache size: 113,624`, `vram_boot=28,436` — matched across
+independent boots to within 80 MiB.
+
+---
+
+## Battle log — setup problems, already solved
+
+Each of these presents as something else entirely. If you deviate from the pinned stack, this
+is your debugging map.
 
 1. **Triton: "Failed to find C compiler"** — Ubuntu-26.04 ships without gcc.
-   → `apt install build-essential`.
-2. **MTP draft head: "Could not find nvcc"** — CUDA *runtime* wheels don't include the compiler.
-   → `uv pip install nvidia-cuda-nvcc`.
-3. **"CUDA compiler and toolkit headers are incompatible"** — nvcc 13.3 against torch's CUDA 13.2
-   headers. → Pin nvcc to torch's version: `nvidia-cuda-nvcc==13.2.*` (setup does this automatically).
-4. **`ptxas fatal: Unsupported .version 9.3`** while FlashInfer built CUTLASS FP4 kernels.
-   → Skip local compilation with the prebuilt kernel cache:
-   `flashinfer-jit-cache==<version> --extra-index-url https://flashinfer.ai/whl/cu130/` (1.4GB).
-5. **Engine dies silently during warmup, no error** — WSL2 defaults to ~50% of host RAM; the parallel
-   kernel compile gets OOM-killed. → Raise the WSL memory cap for first-time setup, then **lower it**
-   (16GB) once caches are warm. A 26GB cap starves Windows on cold boots and freezes the desktop.
-   Also cap `MAX_JOBS=4`.
-6. **Decode collapses to ~10 tok/s under load** (fast after boot, dies later) — GPU memory
-   oversubscription: vLLM's budget + desktop VRAM exceeds the card, Windows pages. → `util 0.89` and
-   keep the desktop lean. This masqueraded as three different bugs before we caught it; always check
-   `nvidia-smi` memory before blaming flags.
-7. **Prefill stuck ~500 tok/s** — two causes: MTP caps the scheduler at 2,048 batched tokens, and
-   piecewise-only CUDA graphs. → `--max-num-batched-tokens 12288` +
-   `--compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'`. Result: ~1,650–5,300 tok/s.
-8. **Every turn re-reads the whole conversation** — vLLM silently sets `enable_prefix_caching=False`
-   on hybrid-Mamba models. → `--enable-prefix-caching --mamba-cache-mode align --prefix-match-unit 16`
-   (vLLM PR #46384, merged July 2026). Repeat turns went from ~20s to 0.39s; hit rates reach 85–88%.
-   Note this mode is experimental and its memory footprint grows over long sessions — hence the
-   0.89 utilization and the optional nightly restart.
-9. **`--default-chat-template-kwargs` wedges the whole server** — on vLLM 0.27.1 it accepts requests
-   that then generate nothing, forever, with zero errors logged. → **Do not use it.** Configure
-   per-client instead.
+   -> `apt install build-essential`.
+2. **MTP draft head: "Could not find nvcc"** — CUDA *runtime* wheels don't include the
+   compiler. -> `uv pip install nvidia-cuda-nvcc`.
+3. **"CUDA compiler and CUDA toolkit headers are incompatible"** — nvcc 13.3 against torch's
+   CUDA 13.2 headers. -> Pin nvcc to torch's exact version: `nvidia-cuda-nvcc==13.2.*`
+   (check with `python -c "import torch; print(torch.version.cuda)"`). SETUP.bat does this.
+4. **`ptxas fatal: Unsupported .version 9.3`** while FlashInfer builds CUTLASS FP4 kernels.
+   -> Don't compile locally; install the prebuilt cache:
+   `flashinfer-jit-cache==<flashinfer version> --extra-index-url https://flashinfer.ai/whl/cu130/`
+   (1.4GB).
+5. **Engine dies silently during warmup, no error** — WSL2 defaults to ~50% of host RAM and
+   the parallel kernel compile gets OOM-killed. -> Raise the WSL memory cap for first-time
+   setup, then **lower it to 16GB** once caches are warm. A 26GB cap starves Windows and
+   freezes the desktop on cold boots. Also cap `MAX_JOBS=4`.
+   Note: `autoMemoryReclaim` belongs under `[experimental]` in `.wslconfig`, not `[wsl2]` —
+   it is silently ignored in the wrong section.
+6. **Prefill stuck ~500 tok/s** — MTP caps the scheduler's batched tokens, and piecewise-only
+   CUDA graphs leave throughput on the table. -> `--compilation-config
+   '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'`. (The companion fix used to be raising
+   `--max-num-batched-tokens`; see the slowdown section for why that backfired.)
+7. **Every turn re-reads the whole conversation** — vLLM silently sets
+   `enable_prefix_caching=False` on hybrid-Mamba models like this one. ->
+   `--enable-prefix-caching --mamba-cache-mode align --prefix-match-unit 16`
+   (vLLM PR #46384). Repeat turns at 30K context: 8.98s -> 3.58s to first token.
+   This mode is experimental; the optional nightly restart exists to bound its growth.
+8. **`--default-chat-template-kwargs` wedges the whole server** — on vLLM 0.27.1 it accepts
+   requests that then generate nothing, forever, with zero errors logged. -> **Never use it.**
+   Configure effort per-client instead.
+9. **ECONNREFUSED from Windows while WSL says healthy** — usually the server is mid-restart.
+   Verify with `curl.exe http://127.0.0.1:8000/health` from PowerShell.
+10. **Per-config flags are invisible to `--help`** — `vllm serve --help` does not list them.
+    Use `vllm serve --help=CacheConfig`, `--help=MambaConfig`, etc. This repo's script
+    auto-detects flag availability that way before passing anything.
 
-### Things that sound like optimizations but aren't (all tested here)
+### Two real bugs fixed in `killall-vllm.sh` (worth stealing)
 
-- **Speculative depth 2** (a popular recommendation): measurably worse. Depth 3 was 27% faster on
-  single-stream work, 64% faster than depth 1. Keep `num_speculative_tokens: 3`.
-- **A "fixed" community chat template**: the official template's empty `<think></think>` blocks for
-  prior turns are correct, well-formed, and cost ~6 tokens per turn. Nothing to fix on vLLM.
-- **bf16 KV cache for long-context quality**: fp8 scored 8/8 needle retrieval at both 40K and 88K.
-  The reported degradation doesn't manifest here, and bf16 would halve your context.
-- **Raising max-model-len past 80K on the 4-slot profile**: the KV pool *shrinks* as the window
-  grows (workspace reservations scale with it). 80K → 111,264-token pool; 84K → 87,262; 88K fails
-  to boot. The surplus at 80K is what powers prefix caching and concurrency.
+1. `pkill -f vllm` **matched the script's own filename** — the stop script killed itself
+   before it could wait for VRAM to release. Every "restart" silently skipped its safety
+   wait, allowing overlapping boots and CUDA OOM on the next start.
+2. vLLM renames the engine subprocess to **`VLLM::EngineCore`** (uppercase). Lowercase
+   patterns never matched it, so engine processes survived "restarts" still holding VRAM.
+   After fixing this, the very next stop reported `killed=3`.
+
+Both fixed with precise process patterns, case-insensitive matching, self-PID exclusion, and
+a wait loop that blocks until `nvidia-smi` reports under 3,000 MiB used.
+
+## Things that sound like optimizations but aren't (all tested here)
+
+- **Raising `--gpu-memory-utilization` to 0.93-0.95 for "15% more VRAM".** This advice assumes
+  an OOM will tell you when you've gone too far. Under WSL2 it never fires — you just get
+  silent sysmem paging. Pin the KV pool explicitly instead and leave the utilization ceiling
+  at 0.90.
+- **4-bit KV cache to reach "121K / 212K context" on a 5090.** It does boot with a
+  135,952-token pool. It also runs at **36 tok/s instead of 115**, and dropped
+  `merge_intervals` from 3/3 to **0/3**. Every viral long-context claim for this card that we
+  could trace back resolved to this trade. Not worth it.
+- **`--mamba-ssm-cache-dtype bfloat16`.** Gives a real +10.5% KV pool (126,914 vs 114,900
+  tokens) and is **broken on this build**: crashes the FlashInfer FP4 autotuner at boot, and
+  with autotune disabled every generation returns HTTP 500 `CUDA driver error: device not
+  ready`. Also note `auto` is **not** bfloat16 for this model — it resolves to the
+  checkpoint's declared fp32 state, so advice claiming "auto already mirrors bf16" is wrong here.
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.** Frees no measurable memory and
+  **crashes the engine** (`CUDA driver error: device not ready`), both in the FP4 autotuner at
+  startup and on 40K-context requests. Mechanism: PyTorch's VMM allocator can't safely remap
+  blocks while vLLM replays static CUDA graphs, which `FULL_AND_PIECEWISE` guarantees it will.
+  Gated behind `ALLOC_EXPAND=1` here and must stay off. Also check it isn't exported in your
+  shell — child processes inherit it (`unset PYTORCH_CUDA_ALLOC_CONF`).
+- **`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`.** Redundant once the KV pool is pinned by
+  bytes; it only affects the profiler's estimate, which no longer decides anything.
+- **Speculative depth 2** (a popular recommendation): measurably worse. Depth 3 was 27% faster
+  than depth 2 on single-stream work and 64% faster than depth 1. Keep 3.
+- **Disabling prefix caching** to avoid its experimental memory growth: costs 8.98s vs 3.58s
+  on every repeat turn at 30K and saves nothing once MNBT is correct.
+- **Swapping in the [froggeric "fixed" chat template](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
+  (v22.1, Aug 2026).** This one is worth taking seriously — it explicitly covers Qwen3.8-27B
+  and explicitly targets vLLM — so it was tested properly by rendering both templates through
+  jinja2 with vLLM's exact message shape. Result:
+
+  | Condition | Outcome |
+  |---|---|
+  | `reasoning_effort: medium`, no tools | **byte-identical output**, 365 chars each |
+  | No effort specified | Official injects the xhigh instruction (602 vs 365 chars) |
+  | With tools | Fixed adds ~480 chars of tool-call discipline rules |
+  | Prefix-cache stability over an 8-step agent loop | **1.000 vs 1.000** — tied, perfect on both |
+  | Rendered size, 8-step tool-calling loop | Official 1,995 tok vs fixed 2,068 tok |
+
+  Its headline claim — *"mutated past turns destroy the prefix cache"* — **does not reproduce
+  on this model.** Measured as the longest common token prefix between consecutive renders,
+  both templates keep 100% of the prefix stable at every step. Neither blanks prior reasoning,
+  and neither emits empty `<think></think>` blocks in vLLM's message shape.
+
+  What it genuinely fixes: the `xhigh` default (real — see the effort table above; but we
+  already send `medium` explicitly, which makes the templates identical), and tool-argument
+  crashes when `arguments` arrives as a JSON string. That second one **does not apply to
+  vLLM**, which pre-parses arguments into a dict before the template sees them
+  (`chat_utils.py`, "per the Transformers docs & maintainers"). It's a llama.cpp problem.
+
+  The one thing it adds that we can't dismiss: extra prompt-level tool-calling guardrails
+  ("no conversational text before the tool call", "tags at the start of a line, no
+  indentation", "never nest `<tool_call>` blocks"). Both templates emit the same wire format
+  (`<function=...>` inside `<tool_call>`), so **no parser change is needed** despite its
+  README suggesting `qwen3_xml` — `qwen3_coder` handles both. We stay on official because
+  tool-call validity here is already 3/3 cold and 3/3 on cache-hit paths, so there is no
+  measured defect for those guardrails to fix, and they cost ~120 tokens on every
+  tool-enabled request. If you ever see malformed tool calls in Cline, this is the targeted fix.
+- **bf16 KV cache "for long-context quality".** fp8 scored 8/8 needle retrieval at both 40K
+  and 88K. The reported degradation does not manifest here, and bf16 would halve your context.
+
+## Accuracy validation
+
+`codeeval.py` is an objective harness, not a vibe check: 8 non-trivial problems (interval
+merging, version comparison, topological sort, token-bucket rate limiter, unified-diff patch
+application, LRU+TTL cache, JSON path query, wildcard matcher), each scored by **executing a
+real test suite** against the model's output. The suites were validated against reference
+implementations first, so a failure can only be the model's.
+
+On the production config: **24/24 code problems, 3/3 tool-call JSON validity, 2/2 long-context
+planted-bug retrieval.** Accuracy is not the constraint on this setup — memory and scheduling are.
+
+Run it yourself: `/opt/qwen38/venv/bin/python codeeval.py --tag mytest --samples 3`
+
+## Is prefix caching safe here? (vLLM #47861)
+
+vLLM [PR #47861](https://github.com/vllm-project/vllm/pull/47861), *"Fix MTP prefix cache
+correctness for hybrid Mamba models"*, is an **unmerged draft**, and 0.27.1 is still the
+newest release — so whatever it describes is live in every current build. It reports that MTP
+speculative decoding combined with prefix caching on hybrid Mamba/GDN models misaligns
+cache-hit lengths between the attention group and the mamba group, producing *"tool-call
+leakage, recall failures and degenerate generations on cache-hit paths"*.
+
+That is exactly this configuration. And a normal eval will not catch it, because a normal eval
+sends fresh prompts — it never takes the cache-hit path.
+
+`cachehit-eval.py` in this repo tests it directly. It runs an identical probe set twice
+against an identical 13K-token codebase prefix: once with a unique leading salt (which
+guarantees a cache **miss**, since vLLM matches from the first token) and once shared
+(guaranteed **hit**), scraping `/metrics` to prove which path each pass actually took.
+
+| | COLD pass | HOT pass |
+|---|---|---|
+| Prefix cache hit rate | **0.0%** | **86.3%** |
+| Needle retrieval from the prefix | 9/9 | 9/9 |
+| Code generation, unit-tested | 6/6 | 6/6 |
+| Tool calls (valid + correct args) | 3/3 | 3/3 |
+| Max repetition score | 0.046 | 0.063 |
+| **Total** | **18/18** | **18/18** |
+
+**No regression on the cache-hit path.** The reported corruption does not manifest on
+Qwen3.8-27B at this configuration. Prefix caching stays on.
+
+Two notes for anyone re-running this. The needle probes returned in 0.7-1.0s hot versus
+2.6-2.8s cold, which is independent behavioural confirmation that the cache was live —
+useful because vLLM 0.27.1 does not populate `prompt_tokens_details.cached_tokens` on this
+path, so per-request `cached_tokens` reads `None` even on a hit. And give the code probes a
+real output budget: at 3,000 tokens they cap out mid-function and score as failures that are
+the harness's fault, not the model's. 7,000 is enough.
+
+Re-run it with: `/opt/qwen38/venv/bin/python cachehit-eval.py --samples 3 --effort medium`
+To A/B against no caching at all: `NO_PREFIX=1 bash serve-wsl.sh`.
 
 ## Profiles
 
-| Profile | Context | Slots | Use |
+| Command | Context | Slots | Use |
 |---|---|---|---|
-| `START-QWEN.bat` (default) | 80K | 4 | Daily driver, tolerates a second user/agent |
-| `START-96K.bat` | 96K | 1 | Max context, single user, bare desktop |
-| `CTX=61440 UTIL=0.88 bash serve-wsl.sh` | 60K | 4 | Heavy desktop use (wallpaper engine, etc.) |
+| `START-QWEN.bat` (default) | 96K | 1 | Daily driver. Every benchmark above was measured on this |
+| `START-SHARED.bat` | 60K | 4 | Two people / parallel agents. Lower context so 4 slots fit the pool |
+| `CTX=49152 bash serve-wsl.sh` | 48K | 1 | Heavy desktop use (wallpaper tools, a game idling) |
 
-Every knob is an environment variable: `CTX`, `UTIL`, `SEQS`, `MNBT`, `SPEC_TOKENS`, `SPEC=0`,
-`KERNEL_FALLBACK=1`.
+Whatever you change, leave `MNBT` at 2048 on a 32GB card and keep `KV_BYTES` pinned. Note that
+raising `SEQS` without lowering `CTX` doesn't buy real concurrency: 4 slots x 96K would need
+393K tokens of KV against a 113K pool, so requests just queue.
 
 ## Remote access (optional)
 
-The server binds `0.0.0.0` inside WSL, which WSL2's NAT keeps off your LAN by default. To reach it
-from another machine, install Tailscale **inside WSL** (`curl -fsSL https://tailscale.com/install.sh | sh`
-then `tailscale up --hostname=qwen-5090`) and use that node's tailnet IP — `serve-wsl.sh` keeps the
-daemon alive automatically. Bearer auth is always on.
+The server binds `0.0.0.0` inside WSL, which WSL2's NAT keeps off your LAN by default. To
+reach it from another machine, install Tailscale **inside WSL**
+(`curl -fsSL https://tailscale.com/install.sh | sh`, then `tailscale up --hostname=qwen-5090`)
+and use that node's tailnet IP — `serve-wsl.sh` keeps the daemon alive automatically. Bearer
+auth is always on. Nothing is exposed to the LAN or the internet.
 
 ## Credits
 
-Built and measured over three days against a real Cline workload. Model by Qwen, NVFP4 quant by
+Built and measured over five days against a real Cline workload. Model by Qwen, NVFP4 quant by
 Unsloth, serving by vLLM.

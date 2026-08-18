@@ -36,9 +36,9 @@ if [ "${DESKTOP_MB:-0}" -gt 1300 ]; then
   echo "!!! Windows pages GPU memory and speed collapses. Close Wallpaper Engine / Chrome / games."
   sleep 10
 fi
-CTX="${CTX:-81920}"
-UTIL="${UTIL:-0.89}"
-SEQS="${SEQS:-4}"
+CTX="${CTX:-98304}"      # 96K, validated
+UTIL="${UTIL:-0.90}"     # ceiling only; the KV pool is pinned by KV_BYTES below
+SEQS="${SEQS:-1}"
 SPEC="${SPEC:-1}"
 SPEC_TOKENS="${SPEC_TOKENS:-3}"
 KERNEL_FALLBACK="${KERNEL_FALLBACK:-0}"
@@ -50,17 +50,33 @@ ARGS=( serve unsloth/Qwen3.8-27B-NVFP4
   --kv-cache-dtype fp8_e4m3
   --gpu-memory-utilization "$UTIL"
   --max-num-seqs "$SEQS"
-  --max-num-batched-tokens "${MNBT:-12288}"
+  --max-num-batched-tokens "${MNBT:-2048}"
+  --kv-cache-memory-bytes "${KV_BYTES:-5000000000}"
   --language-model-only
   --async-scheduling
   --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
-  --enable-prefix-caching
-  --mamba-cache-mode align
-  --prefix-match-unit 16
   --chat-template /opt/qwen38/chat_template_official.jinja
   --reasoning-parser qwen3
   --enable-auto-tool-choice --tool-call-parser qwen3_coder )
+# Prefix caching is a large win (30K repeat turns: 8.98s -> 3.58s to first token) but is
+# experimental on hybrid-Mamba models. NO_PREFIX=1 disables it -- use that to A/B if you
+# ever suspect cache-hit-path output corruption (vLLM PR #47861).
+if [ "${NO_PREFIX:-0}" = "1" ]; then
+  ARGS+=( --no-enable-prefix-caching )
+else
+  ARGS+=( --enable-prefix-caching --mamba-cache-mode align --prefix-match-unit 16 )
+fi
 if [ "$SPEC" = "1" ]; then ARGS+=( --speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": ${SPEC_TOKENS}}" ); fi
 if [ "$KERNEL_FALLBACK" = "1" ]; then ARGS+=( --kernel-config '{"enable_flashinfer_autotune": false}' ); fi
+# --- background health sampler (logs/gpu-watch.csv): catches memory-pressure slowdowns ---
+GPUCSV="$BASE/logs/gpu-watch.csv"
+[ -f "$GPUCSV" ] || echo "epoch,vram_used_mib,gpu_util,sm_clock,power_w,host_used_mb,host_avail_mb,swap_used_mb" > "$GPUCSV"
+( while true; do
+    G=$(nvidia-smi --query-gpu=memory.used,utilization.gpu,clocks.sm,power.draw --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
+    H=$(free -m | awk '/^Mem:/{printf "%s,%s",$3,$7}')
+    S=$(free -m | awk '/^Swap:/{print $3}')
+    echo "$(date +%s),$G,$H,$S" >> "$GPUCSV"
+    sleep 60
+  done ) &
 echo "=== SERVE LAUNCH $(date) ctx=$CTX util=$UTIL seqs=$SEQS spec=$SPEC_TOKENS ==="
 exec vllm "${ARGS[@]}"
