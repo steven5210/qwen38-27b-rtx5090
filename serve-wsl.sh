@@ -52,12 +52,14 @@ ARGS=( serve unsloth/Qwen3.8-27B-NVFP4
   --max-num-seqs "$SEQS"
   --max-num-batched-tokens "${MNBT:-2048}"
   --kv-cache-memory-bytes "${KV_BYTES:-5000000000}"
-  --language-model-only
   --async-scheduling
   --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
   --chat-template /opt/qwen38/chat_template_official.jinja
   --reasoning-parser qwen3
   --enable-auto-tool-choice --tool-call-parser qwen3_coder )
+# VISION=1 keeps the vision tower (~1.1GB, bf16 -- unsloth did NOT quantise it to NVFP4).
+# Costs ~1.5s on cached first-token regardless of KV sizing. See README "Vision".
+if [ "${VISION:-0}" != "1" ]; then ARGS+=( --language-model-only ); else echo "VISION ENABLED"; fi
 # Prefix caching is a large win (30K repeat turns: 8.98s -> 3.58s to first token) but is
 # experimental on hybrid-Mamba models. NO_PREFIX=1 disables it -- use that to A/B if you
 # ever suspect cache-hit-path output corruption (vLLM PR #47861).

@@ -402,12 +402,56 @@ the harness's fault, not the model's. 7,000 is enough.
 Re-run it with: `/opt/qwen38/venv/bin/python cachehit-eval.py --samples 3 --effort medium`
 To A/B against no caching at all: `NO_PREFIX=1 bash serve-wsl.sh`.
 
+## Vision: what it actually costs (measured, 3 boots)
+
+Qwen3.8-27B is a VL model. The default config passes `--language-model-only`, which drops the
+vision tower. Whether that's the right call changed once we pinned the KV pool by bytes, so it
+was re-measured rather than assumed.
+
+**The vision tower is bf16 — unsloth did not quantize it to NVFP4.** 333 tensors, 0.92GB on
+disk, ~1.14GB resident. You pay full price for it.
+
+| | Default (vision off) | Vision @ KV 5.0GB | Vision @ KV 4.4GB |
+|---|---|---|---|
+| KV pool | 113,624 tok | **113,624 tok** | 99,580 tok |
+| Context | 96K | 96K | 96K (pool still > window) |
+| VRAM at boot | 28,436 MiB | 29,575 MiB | 28,815 MiB |
+| Free floor under load | 2,601 MiB | **2,040 MiB** | **2,615 MiB** |
+| Short decode | 114.5 tok/s | 108.6 | 112.8 |
+| 30K first token, cold | 8.98s | 11.07s | 11.03s |
+| **30K first token, cached** | **3.58s** | **5.24s** | **5.26s** |
+| 4-way concurrent | 105.0 | 101.1 | 100.6 |
+| Reads a screenshot correctly | n/a | n/a | **2/2** |
+
+Three things worth pulling out of that table:
+
+1. **Context does not shrink.** With `--kv-cache-memory-bytes` pinned, the pool is fixed and
+   the vision tower comes out of headroom instead. Older advice (including an earlier version
+   of this README) said vision costs context — that was true only under percentage-based
+   sizing.
+2. **KV 4.4GB fully recovers the memory headroom** (2,615 MiB, matching the vision-off
+   baseline) while keeping 96K context, because 99,580 still exceeds the 98,304 window.
+3. **But cached first-token does not recover.** 5.24s at KV 5.0 and 5.26s at KV 4.4 against a
+   3.58s baseline — nearly identical across two very different memory profiles. So that ~46%
+   regression is **not** memory pressure; it is the cost of having the multimodal path active
+   at all. You cannot tune it away by resizing the pool.
+
+Image tokens are not free either. At patch size 16 with 2x2 spatial merge, an image costs
+roughly `(w/16 x h/16) / 4` tokens: ~305 for a small 760x420 crop, but **~3,600 for a
+full 2560x1440 screenshot**. Crop before pasting.
+
+**Recommendation: keep it as a profile, not a default.** `START-VISION.bat` launches the
+KV 4.4GB variant for when you need to paste a mockup or an error screenshot; `START-QWEN.bat`
+stays lean for coding. Verify vision end-to-end with `vision-probe.py`, which renders a
+synthetic stack-trace screenshot and checks that two planted values come back exactly.
+
 ## Profiles
 
 | Command | Context | Slots | Use |
 |---|---|---|---|
 | `START-QWEN.bat` (default) | 96K | 1 | Daily driver. Every benchmark above was measured on this |
 | `START-SHARED.bat` | 60K | 4 | Two people / parallel agents. Lower context so 4 slots fit the pool |
+| `START-VISION.bat` | 96K | 1 | Screenshots / mockups. Costs ~1.7s on cached first-token |
 | `CTX=49152 bash serve-wsl.sh` | 48K | 1 | Heavy desktop use (wallpaper tools, a game idling) |
 
 Whatever you change, leave `MNBT` at 2048 on a 32GB card and keep `KV_BYTES` pinned. Note that
