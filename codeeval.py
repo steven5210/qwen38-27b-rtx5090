@@ -7,7 +7,10 @@ import argparse, json, os, re, subprocess, sys, tempfile, time, urllib.request
 KEY = open('/opt/qwen38/api-key.txt').read().strip()
 URL = "http://127.0.0.1:8000/v1/chat/completions"
 
-def chat(messages, max_tokens=6000, effort="medium", tools=None, seed=None, temp=1.0):
+import os as _os
+DEFAULT_EFFORT=_os.environ.get("EVAL_EFFORT","medium")
+def chat(messages, max_tokens=6000, effort=None, tools=None, seed=None, temp=1.0):
+    effort = effort or DEFAULT_EFFORT
     body = {"model":"qwen3.8-27b","messages":messages,"max_tokens":max_tokens,
             "temperature":temp,"top_p":0.95,"reasoning_effort":effort}
     if seed is not None: body["seed"]=seed
@@ -156,7 +159,7 @@ def longctx_test(seed, target=40000):
                    "    return dispatch(payload, retries=-1)   # <-- differs from every other handler\n\n")%bug_at
     src="".join(parts)
     msgs=[{"role":"user","content":"Below is a module where every handler is identical except ONE, which passes a different retries value.\n```python\n"+src+"```\nReply with ONLY the name of that one function (e.g. svc_123)."}]
-    r=chat(msgs,max_tokens=2500,effort="medium",seed=seed)
+    r=chat(msgs,max_tokens=2500,seed=seed)
     want=f"svc_{bug_at}"
     return (want in r["content"]), f"want {want}, got {r['content'][-60:].strip()!r}"
 

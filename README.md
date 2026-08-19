@@ -148,6 +148,60 @@ Env the script sets for you: `HF_HOME`, `CUDA_HOME` pointing at the venv's cu13,
 `MAX_JOBS=4`, `NVCC_THREADS=2`, persistent FlashInfer-autotune and Triton cache dirs (this is
 what makes warm boots 2.5 min instead of 5), and `VLLM_ENGINE_READY_TIMEOUT_S=1800`.
 
+## Do NOT use reasoning_effort xhigh for agent coding
+
+The template's default is `xhigh`, and that default is actively harmful for coding work. This
+was measured, not assumed — the full unit-tested eval run at each level, same session, same
+problems:
+
+| | xhigh | medium |
+|---|---|---|
+| Code problems passed | **9/24** | **24/24** |
+| Tool calls | 3/3 | 3/3 |
+| Long-context | 2/2 | 2/2 |
+| **Wall clock** | **1,533s** | **360s** |
+
+4.3x slower for a third of the score. But the *reason* matters, because it is not what it looks
+like. Every failure carried `finish_reason: "length"`:
+
+| finish_reason | count | passed |
+|---|---|---|
+| `stop` (finished) | 9 | **9/9 — 100%** |
+| `length` (hit the cap) | 15 | **0/15 — 0%** |
+
+Perfect correlation. **xhigh never once produced a wrong answer — it produced unfinished
+ones.** When it was allowed to finish it was correct every single time. The quality of its
+reasoning is not the problem; it simply does not stop.
+
+The obvious next question is whether a bigger budget rescues it. It does not. Re-running the
+failures at **16,384 tokens** — a realistic Cline `Max Output` setting, nearly 3x the eval's
+default — still gives **6/12**, with every failure again a truncation:
+
+| Problem | xhigh @ 6K | xhigh @ 16,384 | medium @ 6K |
+|---|---|---|---|
+| version_compare | 2/3 | 2/2 | 3/3 |
+| toposort | 1/3 | 2/2 | 3/3 |
+| apply_patch | 0/3 | 1/2 | 3/3 |
+| json_path | 0/3 | 1/2 | 3/3 |
+| lru_ttl | 0/3 | **0/2** | 3/3 |
+| wildcard_match | 0/3 | **0/2** | 3/3 |
+
+When xhigh succeeded it used 2,429 / 6,144 / 6,565 / 11,727 / 12,294 / 12,932 tokens. When it
+failed it consumed the entire 16,384 and ran **200-240 seconds** producing nothing usable.
+Medium finished all of the same problems correctly, every time, under 6,000 tokens.
+
+There is a matching signal in the speculative-decode counters: MTP acceptance falls to **34%**
+at xhigh versus 58% at medium, dragging decode to 65 tok/s. Reasoning tokens are simply less
+predictable to the draft head, so xhigh is slower per token *and* emits several times more of
+them.
+
+**Set `reasoning_effort: medium` explicitly in every client.** Leaving it unset gives you
+xhigh, because that is the template default — this is the single most impactful client setting
+on the whole stack. Save xhigh for one-off hard problems in a chat window where a four-minute
+answer and a possible retry are acceptable. It has no place in an agent loop.
+
+Reproduce with `EVAL_EFFORT=xhigh python codeeval.py --tag xh --samples 3`.
+
 ## MTP speculative decoding: what acceptance actually looks like
 
 `num_speculative_tokens: 3` means the MTP head proposes 3 tokens per step and the main model
