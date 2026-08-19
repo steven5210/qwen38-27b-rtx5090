@@ -8,6 +8,53 @@ Every flag in here exists because something broke without it. The battle log is 
 of this repo: a dozen problems that each cost hours, already solved — including one that makes
 the server *silently* 27x slower after a few minutes of use, with no error anywhere.
 
+## Quick reference
+
+If you read nothing else, read this. Every value is measured, not guessed; the section links
+explain why.
+
+**Client settings (Cline / Roo / Continue)**
+
+| Setting | Value | Why |
+|---|---|---|
+| Base URL | `http://127.0.0.1:8000/v1` | |
+| Model | `qwen3.8-27b` | |
+| API key | from `api-key.txt` | auto-generated on first run |
+| **Context Window Size** | **96000** | [prompt+output cap](#the-cap-is-prompt--output-not-prompt) |
+| **Max Output Tokens** | **16384** | thinking shares this budget |
+| **Temperature** | **1.0, set explicitly** | some clients send 0; greedy decoding makes thinking models loop |
+| **Reasoning Effort** | **medium** | [the single most impactful setting here](#do-not-use-reasoning_effort-xhigh-for-agent-coding) |
+| Auto-condense | ~60% | compaction is an LLM call too |
+
+**Server defaults** (all overridable by env var, no editing)
+
+| | Value |
+|---|---|
+| Context | 104K (`CTX=106496`) → **90,112 usable prompt** at 16,384 output |
+| KV pool | 115,587 tokens, pinned (`KV_BYTES=5000000000`) |
+| Batched tokens | **`MNBT=2048`** — do not raise on a 32GB card |
+| Slots / util | `SEQS=1`, `UTIL=0.90` |
+| Spec decode | MTP depth 3 (67.8% lifetime acceptance) |
+| Vision | off (`VISION=1` to enable, costs ~1.1GB) |
+
+**Commands**
+
+| | |
+|---|---|
+| `START-QWEN.bat` | daily driver |
+| `STOP-QWEN.bat` | stop |
+| `ASK-XHIGH.bat "question"` | [deep-think mode](#how-much-room-does-xhigh-actually-need-and-why-no-setting-fixes-it) — one hard question, 4-10 min |
+| `START-VISION.bat` | screenshots / mockups |
+| `START-SHARED.bat` | two people, 60K context |
+
+**The three things that will bite you**
+
+1. **Desktop VRAM over ~1.3GB** → Windows pages GPU memory, 10x slowdown, no error. Close Wallpaper Engine.
+2. **Reasoning effort left unset** → you get `xhigh`, the template default, which scored **9/24 vs medium's 24/24** here.
+3. **Raising `--max-num-batched-tokens`** → looks like a prefill optimization, silently makes the server 27x slower after ten minutes.
+
+---
+
 ## Measured performance
 
 Reference machine: Ryzen 9 5900X / 32GB RAM / RTX 5090 32GB / Win11 + WSL2 Ubuntu-26.04.
@@ -59,6 +106,19 @@ Then point any OpenAI-compatible client at:
 Stop with `STOP-QWEN.bat`. Closing the server window also stops it. It does **not** auto-start
 on boot, by design.
 
+## Client settings (Cline / Roo / Continue / any OpenAI client)
+
+| Setting | Value | Why |
+|---|---|---|
+| Context Window Size | **96000** | Cline compacts at ~81% of this (~77,800 tokens), leaving ~12,300 of margin under the 90,112 hard prompt ceiling. See "the cap is prompt + output" |
+| Max Output Tokens | **16384** | Thinking shares this budget — starving it truncates turns mid-tool-call |
+| Temperature | **1.0, explicitly set** | Some clients send 0 by default; greedy decoding makes thinking models loop |
+| Reasoning Effort | **medium** | Default is `xhigh`. See the effort section below — this is the single biggest quality-of-life setting |
+| Auto-condense threshold | **~60%** | Compaction requests are LLM calls too; they fail if the conversation is already huge |
+
+Anything you don't send (top_p / top_k / min_p) falls back to the checkpoint's recommended
+values (0.95 / 20 / 0). The server never overrides client-sent values; it only fills gaps.
+
 ## The cap is prompt + output, not prompt
 
 This is the single most misread number in the whole setup. `--max-model-len` bounds
@@ -105,19 +165,6 @@ regression signal because Cline really does overlap requests (a normal turn arri
 auto-condense call is in flight), and it catches scheduler pathologies. It does **not** mean
 this profile serves four users; use `START-SHARED.bat` for that.
 
-## Client settings (Cline / Roo / Continue / any OpenAI client)
-
-| Setting | Value | Why |
-|---|---|---|
-| Context Window Size | **96000** | Cline compacts at ~81% of this (~77,800 tokens), leaving ~12,300 of margin under the 90,112 hard prompt ceiling. See "the cap is prompt + output" |
-| Max Output Tokens | **16384** | Thinking shares this budget — starving it truncates turns mid-tool-call |
-| Temperature | **1.0, explicitly set** | Some clients send 0 by default; greedy decoding makes thinking models loop |
-| Reasoning Effort | **medium** | Default is `xhigh`. See the effort section below — this is the single biggest quality-of-life setting |
-| Auto-condense threshold | **~60%** | Compaction requests are LLM calls too; they fail if the conversation is already huge |
-
-Anything you don't send (top_p / top_k / min_p) falls back to the checkpoint's recommended
-values (0.95 / 20 / 0). The server never overrides client-sent values; it only fills gaps.
-
 ## The locked configuration, and why every flag is there
 
 ```
@@ -148,157 +195,19 @@ Env the script sets for you: `HF_HOME`, `CUDA_HOME` pointing at the venv's cu13,
 `MAX_JOBS=4`, `NVCC_THREADS=2`, persistent FlashInfer-autotune and Triton cache dirs (this is
 what makes warm boots 2.5 min instead of 5), and `VLLM_ENGINE_READY_TIMEOUT_S=1800`.
 
-## How much room does xhigh actually need? (and why no setting fixes it)
+## Profiles
 
-The natural follow-up to the section below: every xhigh failure was truncation, so does a
-bigger output budget fix it? The honest answer required measuring where xhigh *naturally
-stops* rather than repeatedly capping it. Given a 48,000-token ceiling and a realistic ~20.5K
-coding prompt:
-
-| Problem | Natural stop | Time | Result |
+| Command | Context | Slots | Use |
 |---|---|---|---|
-| lru_ttl | 15,493 | 237s | pass |
-| lru_ttl (2nd sample) | 21,500 | 275s | pass |
-| schedule | 25,686 | 341s | pass |
-| wildcard_match | 41,356 | 571s | pass |
-| cont_frac | **>48,000** | 612s | **truncated — nothing usable** |
+| `START-QWEN.bat` (default) | 104K | 1 | Daily driver. Every benchmark above was measured on this |
+| `START-SHARED.bat` | 60K | 4 | Two people / parallel agents. Lower context so 4 slots fit the pool |
+| `START-VISION.bat` | 96K | 1 | Screenshots / mockups. Costs ~1.7s on cached first-token |
+| `ASK-XHIGH.bat` | n/a | 1 | Deep-think one-off. Small prompt, ~90K output room, 4-10 min |
+| `CTX=49152 bash serve-wsl.sh` | 48K | 1 | Heavy desktop use (wallpaper tools, a game idling) |
 
-Median 23,593. **Range 15.5K to beyond 48K for the same class of task — a 3x+ spread.**
-
-Two conclusions, and they point opposite ways:
-
-1. **xhigh's reasoning is fine.** 4 of 5 passed once it wasn't starved, and the one failure was
-   again truncation, not a wrong answer. The earlier 9/24 was an artifact of a 6,000-token cap.
-   Qwen's own model card explains why: it specifies **262,144 tokens for reasoning content**.
-   Every practical budget on a 32GB card is a small fraction of the design point.
-2. **No client setting makes it reliable here.** Because `max-model-len` bounds prompt +
-   output together, buying output room costs context:
-
-   | Max Output | Safe Cline context window | Cost vs 96,000 |
-   |---|---|---|
-   | 16,384 (default here) | 96,000 | — |
-   | 32,768 | 90,000 | 6,000 |
-   | 48,000 | 70,000 | 26,000 |
-   | 64,000 | 50,000 | 46,000 |
-
-   Even 48,000 — a quarter of your context window — was not enough for `cont_frac`. And medium
-   solved that same problem in **3,405 tokens and 36 seconds**, a 14x token multiplier in
-   medium's favour, with medium being the one that got it right.
-
-**Verdict: medium for all agent and coding work.** The cost of xhigh is not merely slowness;
-it is unbounded and unpredictable slowness, on a budget you cannot make large enough without
-gutting your context. Reserve xhigh for a deliberate single hard question in a chat window
-where you can raise `max_tokens` to 60,000+, keep the prompt small, and wait ten minutes —
-and accept that some problems still will not finish.
-
-## Do NOT use reasoning_effort xhigh for agent coding
-
-The template's default is `xhigh`, and that default is actively harmful for coding work. This
-was measured, not assumed — the full unit-tested eval run at each level, same session, same
-problems:
-
-| | xhigh | medium |
-|---|---|---|
-| Code problems passed | **9/24** | **24/24** |
-| Tool calls | 3/3 | 3/3 |
-| Long-context | 2/2 | 2/2 |
-| **Wall clock** | **1,533s** | **360s** |
-
-4.3x slower for a third of the score. But the *reason* matters, because it is not what it looks
-like. Every failure carried `finish_reason: "length"`:
-
-| finish_reason | count | passed |
-|---|---|---|
-| `stop` (finished) | 9 | **9/9 — 100%** |
-| `length` (hit the cap) | 15 | **0/15 — 0%** |
-
-Perfect correlation. **xhigh never once produced a wrong answer — it produced unfinished
-ones.** When it was allowed to finish it was correct every single time. The quality of its
-reasoning is not the problem; it simply does not stop.
-
-The obvious next question is whether a bigger budget rescues it. It does not. Re-running the
-failures at **16,384 tokens** — a realistic Cline `Max Output` setting, nearly 3x the eval's
-default — still gives **6/12**, with every failure again a truncation:
-
-| Problem | xhigh @ 6K | xhigh @ 16,384 | medium @ 6K |
-|---|---|---|---|
-| version_compare | 2/3 | 2/2 | 3/3 |
-| toposort | 1/3 | 2/2 | 3/3 |
-| apply_patch | 0/3 | 1/2 | 3/3 |
-| json_path | 0/3 | 1/2 | 3/3 |
-| lru_ttl | 0/3 | **0/2** | 3/3 |
-| wildcard_match | 0/3 | **0/2** | 3/3 |
-
-When xhigh succeeded it used 2,429 / 6,144 / 6,565 / 11,727 / 12,294 / 12,932 tokens. When it
-failed it consumed the entire 16,384 and ran **200-240 seconds** producing nothing usable.
-Medium finished all of the same problems correctly, every time, under 6,000 tokens.
-
-There is a matching signal in the speculative-decode counters: MTP acceptance falls to **34%**
-at xhigh versus 58% at medium, dragging decode to 65 tok/s. Reasoning tokens are simply less
-predictable to the draft head, so xhigh is slower per token *and* emits several times more of
-them.
-
-**Set `reasoning_effort: medium` explicitly in every client.** Leaving it unset gives you
-xhigh, because that is the template default — this is the single most impactful client setting
-on the whole stack. See the section above for why no output-budget setting rescues xhigh on
-32GB, and what the one legitimate use for it is.
-
-### A note on the thinking_token_budget escape hatch
-
-vLLM 0.27.1 does support `thinking_token_budget` (a top-level chat-completions field) which
-caps thinking specifically. It works — a prompt that produced 0 answer characters at
-`max_tokens: 2000` returned a complete 2,561-character answer with `thinking_token_budget: 300`.
-But swept against medium as a control it never wins:
-
-| Arm | Score | Wall |
-|---|---|---|
-| **medium** | **8/8** | **307s** |
-| xhigh + budget 2,500 | 2/8 | 378s |
-| xhigh + budget 4,000 | 4/8 | 694s |
-| xhigh + budget 6,000 | 6/8 | 1,040s |
-| xhigh + budget 8,000 | 6/8 (plateau) | 1,200s |
-
-It also changes the failure mode for the worse: capped-thinking failures return
-`finish_reason: stop` — confidently wrong answers rather than detectably truncated ones.
-
-One caveat if you use it anyway: vLLM issue #44676 reports that on Qwen3.5+ the budget tracker
-does not treat `<tool_call>` as an implicit reasoning end, so it can inject the reasoning-end
-string into the middle of tool-call JSON and poison conversation history. Confirmed present in
-this build (`thinking_budget_state.py` contains zero references to `tool_call`). It did not
-reproduce in 8/8 clean tool calls here, but the issue reports ~0.5% incidence in production —
-a small sample cannot rule it out.
-
-Reproduce with `EVAL_EFFORT=xhigh python codeeval.py --tag xh --samples 3`.
-
-## MTP speculative decoding: what acceptance actually looks like
-
-`num_speculative_tokens: 3` means the MTP head proposes 3 tokens per step and the main model
-verifies them. Accepted tokens are free throughput; rejected ones are wasted compute. Measured
-per workload from vLLM's own counters (`vllm:spec_decode_*`):
-
-| Workload | Acceptance | Mean accepted per draft | Decode |
-|---|---|---|---|
-| Short codegen, thinking off | **96.3%** | 2.89 of 3 | fastest |
-| Long code generation, effort medium | 58.5% | 1.75 of 3 | 88.9 tok/s |
-| Cached repeat of that same task | 58.0% | 1.74 of 3 | 89.2 tok/s |
-| Deep reasoning, effort xhigh | **34.0%** | 1.02 of 3 | 65.4 tok/s |
-| **Lifetime across a mixed session** | **67.8%** | **2.03 of 3** | — |
-
-Per draft position, lifetime: position 0 accepted **82.3%**, position 1 **66.8%**,
-position 2 **54.2%**.
-
-Two things fall out of this:
-
-1. **This is the hard evidence for depth 3 over depth 2.** The third draft position still lands
-   more than half the time across a real workload mix. Dropping to 2 forfeits that outright,
-   which is exactly what the earlier head-to-head measured (depth 3 was 27% faster).
-2. **Acceptance is the mechanism behind the effort/speed relationship.** Deep reasoning isn't
-   slower merely because it emits more tokens — it emits *less predictable* tokens, so
-   acceptance collapses from 96% to 34% and per-token speed falls with it. Structured code is
-   highly predictable to the draft head; open-ended reasoning is not.
-
-Note that prefix caching does not change acceptance (58.0% cached vs 58.5% uncached) — the two
-optimizations are independent. Reproduce with `specstats.py`.
+Whatever you change, leave `MNBT` at 2048 on a 32GB card and keep `KV_BYTES` pinned. Note that
+raising `SEQS` without lowering `CTX` doesn't buy real concurrency: 4 slots x 96K would need
+393K tokens of KV against a 113K pool, so requests just queue.
 
 ## The one rule that matters: keep desktop VRAM low
 
@@ -315,39 +224,7 @@ The script also writes `logs/gpu-watch.csv` every 60 seconds while serving. On a
 that column is *flat*. If it climbs toward 32,000 MiB, something is oversubscribed — read the
 next section.
 
-## reasoning_effort: the dial nobody mentions
-
-Qwen3.8 supports `reasoning_effort` with levels **xhigh (default), medium, low** — plus
-thinking off entirely via `chat_template_kwargs: {"enable_thinking": false}`. The mechanism is
-a single instruction injected by the official chat template; `medium` injects nothing at all,
-so it is the model's natural depth.
-
-Measured here, two prompts, 9,000-token output budget:
-
-| Prompt | Effort | Wall time | Tokens out | Answer produced? |
-|---|---|---|---|---|
-| easy | low | 23.3s | 2,373 | yes |
-| easy | medium | **9.4s** | 908 | yes |
-| easy | xhigh | 12.5s | 985 | yes |
-| hard | low | **73.1s** | 6,705 | yes |
-| hard | medium | 81.7s | 7,564 | yes (most complete) |
-| hard | xhigh | 119.8s | 9,000 | **no — burned the entire budget thinking** |
-
-Two things this settles:
-
-1. **Effort changes token *count*, not token *rate*.** Decode held at 75-102 tok/s at every
-   level. "xhigh is slow" really means "xhigh writes 4x as much".
-2. **The default (`xhigh`) is why the model appears to hang.** On the hard prompt it consumed
-   a 9,000-token budget and emitted zero answer characters. Set `medium` in your client and
-   most "it thinks forever" complaints disappear.
-
-`low` is not reliably faster — on the easy prompt it produced *more* tokens than medium
-(it skips planning and rambles). Use medium as the default; xhigh only for genuinely hard
-one-off problems where you can afford a large output budget.
-
----
-
-# The silent 27x slowdown — root cause and fix
+## The silent 27x slowdown — root cause and fix
 
 This is the finding that justifies the whole repo. Symptom: **the server is fast right after
 boot and progressively collapses over the next 10-15 minutes of real work.** No error, no OOM,
@@ -434,6 +311,307 @@ Boot is now reproducible: `GPU KV cache size: 113,624`, `vram_boot=28,436` — m
 independent boots to within 80 MiB.
 
 ---
+
+## reasoning_effort: the dial nobody mentions
+
+Qwen3.8 supports `reasoning_effort` with levels **xhigh (default), medium, low** — plus
+thinking off entirely via `chat_template_kwargs: {"enable_thinking": false}`. The mechanism is
+a single instruction injected by the official chat template; `medium` injects nothing at all,
+so it is the model's natural depth.
+
+Measured here, two prompts, 9,000-token output budget:
+
+| Prompt | Effort | Wall time | Tokens out | Answer produced? |
+|---|---|---|---|---|
+| easy | low | 23.3s | 2,373 | yes |
+| easy | medium | **9.4s** | 908 | yes |
+| easy | xhigh | 12.5s | 985 | yes |
+| hard | low | **73.1s** | 6,705 | yes |
+| hard | medium | 81.7s | 7,564 | yes (most complete) |
+| hard | xhigh | 119.8s | 9,000 | **no — burned the entire budget thinking** |
+
+Two things this settles:
+
+1. **Effort changes token *count*, not token *rate*.** Decode held at 75-102 tok/s at every
+   level. "xhigh is slow" really means "xhigh writes 4x as much".
+2. **The default (`xhigh`) is why the model appears to hang.** On the hard prompt it consumed
+   a 9,000-token budget and emitted zero answer characters. Set `medium` in your client and
+   most "it thinks forever" complaints disappear.
+
+`low` is not reliably faster — on the easy prompt it produced *more* tokens than medium
+(it skips planning and rambles). Use medium as the default; xhigh only for genuinely hard
+one-off problems where you can afford a large output budget.
+
+---
+
+## Do NOT use reasoning_effort xhigh for agent coding
+
+The template's default is `xhigh`, and that default is actively harmful for coding work. This
+was measured, not assumed — the full unit-tested eval run at each level, same session, same
+problems:
+
+| | xhigh | medium |
+|---|---|---|
+| Code problems passed | **9/24** | **24/24** |
+| Tool calls | 3/3 | 3/3 |
+| Long-context | 2/2 | 2/2 |
+| **Wall clock** | **1,533s** | **360s** |
+
+4.3x slower for a third of the score. But the *reason* matters, because it is not what it looks
+like. Every failure carried `finish_reason: "length"`:
+
+| finish_reason | count | passed |
+|---|---|---|
+| `stop` (finished) | 9 | **9/9 — 100%** |
+| `length` (hit the cap) | 15 | **0/15 — 0%** |
+
+Perfect correlation. **xhigh never once produced a wrong answer — it produced unfinished
+ones.** When it was allowed to finish it was correct every single time. The quality of its
+reasoning is not the problem; it simply does not stop.
+
+The obvious next question is whether a bigger budget rescues it. It does not. Re-running the
+failures at **16,384 tokens** — a realistic Cline `Max Output` setting, nearly 3x the eval's
+default — still gives **6/12**, with every failure again a truncation:
+
+| Problem | xhigh @ 6K | xhigh @ 16,384 | medium @ 6K |
+|---|---|---|---|
+| version_compare | 2/3 | 2/2 | 3/3 |
+| toposort | 1/3 | 2/2 | 3/3 |
+| apply_patch | 0/3 | 1/2 | 3/3 |
+| json_path | 0/3 | 1/2 | 3/3 |
+| lru_ttl | 0/3 | **0/2** | 3/3 |
+| wildcard_match | 0/3 | **0/2** | 3/3 |
+
+When xhigh succeeded it used 2,429 / 6,144 / 6,565 / 11,727 / 12,294 / 12,932 tokens. When it
+failed it consumed the entire 16,384 and ran **200-240 seconds** producing nothing usable.
+Medium finished all of the same problems correctly, every time, under 6,000 tokens.
+
+There is a matching signal in the speculative-decode counters: MTP acceptance falls to **34%**
+at xhigh versus 58% at medium, dragging decode to 65 tok/s. Reasoning tokens are simply less
+predictable to the draft head, so xhigh is slower per token *and* emits several times more of
+them.
+
+**Set `reasoning_effort: medium` explicitly in every client.** Leaving it unset gives you
+xhigh, because that is the template default — this is the single most impactful client setting
+on the whole stack. See the section above for why no output-budget setting rescues xhigh on
+32GB, and what the one legitimate use for it is.
+
+### A note on the thinking_token_budget escape hatch
+
+vLLM 0.27.1 does support `thinking_token_budget` (a top-level chat-completions field) which
+caps thinking specifically. It works — a prompt that produced 0 answer characters at
+`max_tokens: 2000` returned a complete 2,561-character answer with `thinking_token_budget: 300`.
+But swept against medium as a control it never wins:
+
+| Arm | Score | Wall |
+|---|---|---|
+| **medium** | **8/8** | **307s** |
+| xhigh + budget 2,500 | 2/8 | 378s |
+| xhigh + budget 4,000 | 4/8 | 694s |
+| xhigh + budget 6,000 | 6/8 | 1,040s |
+| xhigh + budget 8,000 | 6/8 (plateau) | 1,200s |
+
+It also changes the failure mode for the worse: capped-thinking failures return
+`finish_reason: stop` — confidently wrong answers rather than detectably truncated ones.
+
+One caveat if you use it anyway: vLLM issue #44676 reports that on Qwen3.5+ the budget tracker
+does not treat `<tool_call>` as an implicit reasoning end, so it can inject the reasoning-end
+string into the middle of tool-call JSON and poison conversation history. Confirmed present in
+this build (`thinking_budget_state.py` contains zero references to `tool_call`). It did not
+reproduce in 8/8 clean tool calls here, but the issue reports ~0.5% incidence in production —
+a small sample cannot rule it out.
+
+Reproduce with `EVAL_EFFORT=xhigh python codeeval.py --tag xh --samples 3`.
+
+## How much room does xhigh actually need? (and why no setting fixes it)
+
+The natural follow-up to the section below: every xhigh failure was truncation, so does a
+bigger output budget fix it? The honest answer required measuring where xhigh *naturally
+stops* rather than repeatedly capping it. Given a 48,000-token ceiling and a realistic ~20.5K
+coding prompt:
+
+| Problem | Natural stop | Time | Result |
+|---|---|---|---|
+| lru_ttl | 15,493 | 237s | pass |
+| lru_ttl (2nd sample) | 21,500 | 275s | pass |
+| schedule | 25,686 | 341s | pass |
+| wildcard_match | 41,356 | 571s | pass |
+| cont_frac | **>48,000** | 612s | **truncated — nothing usable** |
+
+Median 23,593. **Range 15.5K to beyond 48K for the same class of task — a 3x+ spread.**
+
+Two conclusions, and they point opposite ways:
+
+1. **xhigh's reasoning is fine.** 4 of 5 passed once it wasn't starved, and the one failure was
+   again truncation, not a wrong answer. The earlier 9/24 was an artifact of a 6,000-token cap.
+   Qwen's own model card explains why: it specifies **262,144 tokens for reasoning content**.
+   Every practical budget on a 32GB card is a small fraction of the design point.
+2. **No client setting makes it reliable here.** Because `max-model-len` bounds prompt +
+   output together, buying output room costs context:
+
+   | Max Output | Safe Cline context window | Cost vs 96,000 |
+   |---|---|---|
+   | 16,384 (default here) | 96,000 | — |
+   | 32,768 | 90,000 | 6,000 |
+   | 48,000 | 70,000 | 26,000 |
+   | 64,000 | 50,000 | 46,000 |
+
+   Even 48,000 — a quarter of your context window — was not enough for `cont_frac`. And medium
+   solved that same problem in **3,405 tokens and 36 seconds**, a 14x token multiplier in
+   medium's favour, with medium being the one that got it right.
+
+**Verdict: medium for all agent and coding work.** The cost of xhigh is not merely slowness;
+it is unbounded and unpredictable slowness, on a budget you cannot make large enough without
+gutting your context.
+
+### The one place xhigh does work: `ASK-XHIGH.bat`
+
+Rather than degrading your Cline config to accommodate it, use xhigh where it actually fits —
+a *small* prompt, which leaves nearly the whole 106,496-token window free for reasoning:
+
+```
+ASK-XHIGH.bat "why does this deadlock when two workers retry at once?"
+ASK-XHIGH.bat --file src\worker.py "find the race condition"
+```
+
+With a ~100-token prompt there is room for ~90,000 output tokens — roughly double the largest
+natural stopping point we measured, so it finishes. It streams, shows the thinking gap, and
+reports real token counts from the API rather than counting stream deltas (which undercounts,
+and this build does not reliably split `reasoning_content` in streaming mode).
+
+Measured on the smoke test: 3,012 output tokens in 43s at 69 tok/s — the expected xhigh decode
+rate, with essentially all of it thinking and a short final answer.
+
+This keeps Cline on medium at full 96,000 context while still giving you a genuine deep-think
+mode for the hard one-off question. That is the answer to "can I have xhigh as an option":
+yes, just not inside the agent loop.
+
+## MTP speculative decoding: what acceptance actually looks like
+
+`num_speculative_tokens: 3` means the MTP head proposes 3 tokens per step and the main model
+verifies them. Accepted tokens are free throughput; rejected ones are wasted compute. Measured
+per workload from vLLM's own counters (`vllm:spec_decode_*`):
+
+| Workload | Acceptance | Mean accepted per draft | Decode |
+|---|---|---|---|
+| Short codegen, thinking off | **96.3%** | 2.89 of 3 | fastest |
+| Long code generation, effort medium | 58.5% | 1.75 of 3 | 88.9 tok/s |
+| Cached repeat of that same task | 58.0% | 1.74 of 3 | 89.2 tok/s |
+| Deep reasoning, effort xhigh | **34.0%** | 1.02 of 3 | 65.4 tok/s |
+| **Lifetime across a mixed session** | **67.8%** | **2.03 of 3** | — |
+
+Per draft position, lifetime: position 0 accepted **82.3%**, position 1 **66.8%**,
+position 2 **54.2%**.
+
+Two things fall out of this:
+
+1. **This is the hard evidence for depth 3 over depth 2.** The third draft position still lands
+   more than half the time across a real workload mix. Dropping to 2 forfeits that outright,
+   which is exactly what the earlier head-to-head measured (depth 3 was 27% faster).
+2. **Acceptance is the mechanism behind the effort/speed relationship.** Deep reasoning isn't
+   slower merely because it emits more tokens — it emits *less predictable* tokens, so
+   acceptance collapses from 96% to 34% and per-token speed falls with it. Structured code is
+   highly predictable to the draft head; open-ended reasoning is not.
+
+Note that prefix caching does not change acceptance (58.0% cached vs 58.5% uncached) — the two
+optimizations are independent. Reproduce with `specstats.py`.
+
+## Vision: what it actually costs (measured, 3 boots)
+
+Qwen3.8-27B is a VL model. The default config passes `--language-model-only`, which drops the
+vision tower. Whether that's the right call changed once we pinned the KV pool by bytes, so it
+was re-measured rather than assumed.
+
+**The vision tower is bf16 — unsloth did not quantize it to NVFP4.** 333 tensors, 0.92GB on
+disk, ~1.14GB resident. You pay full price for it.
+
+| | Default (vision off) | Vision @ KV 5.0GB | Vision @ KV 4.4GB |
+|---|---|---|---|
+| KV pool | 113,624 tok | **113,624 tok** | 99,580 tok |
+| Context | 96K | 96K | 96K (pool still > window) |
+| VRAM at boot | 28,436 MiB | 29,575 MiB | 28,815 MiB |
+| Free floor under load | 2,601 MiB | **2,040 MiB** | **2,615 MiB** |
+| Short decode | 114.5 tok/s | 108.6 | 112.8 |
+| 30K first token, cold | 8.98s | 11.07s | 11.03s |
+| **30K first token, cached** | **3.58s** | **5.24s** | **5.26s** |
+| 4-way concurrent | 105.0 | 101.1 | 100.6 |
+| Reads a screenshot correctly | n/a | n/a | **2/2** |
+
+Three things worth pulling out of that table:
+
+1. **Context does not shrink.** With `--kv-cache-memory-bytes` pinned, the pool is fixed and
+   the vision tower comes out of headroom instead. Older advice (including an earlier version
+   of this README) said vision costs context — that was true only under percentage-based
+   sizing.
+2. **KV 4.4GB fully recovers the memory headroom** (2,615 MiB, matching the vision-off
+   baseline) while keeping 96K context, because 99,580 still exceeds the 98,304 window.
+3. **But cached first-token does not recover.** 5.24s at KV 5.0 and 5.26s at KV 4.4 against a
+   3.58s baseline — nearly identical across two very different memory profiles. So that ~46%
+   regression is **not** memory pressure; it is the cost of having the multimodal path active
+   at all. You cannot tune it away by resizing the pool.
+
+Image tokens are not free either. At patch size 16 with 2x2 spatial merge, an image costs
+roughly `(w/16 x h/16) / 4` tokens: ~305 for a small 760x420 crop, but **~3,600 for a
+full 2560x1440 screenshot**. Crop before pasting.
+
+**Recommendation: keep it as a profile, not a default.** `START-VISION.bat` launches the
+KV 4.4GB variant for when you need to paste a mockup or an error screenshot; `START-QWEN.bat`
+stays lean for coding. Verify vision end-to-end with `vision-probe.py`, which renders a
+synthetic stack-trace screenshot and checks that two planted values come back exactly.
+
+## Is prefix caching safe here? (vLLM #47861)
+
+vLLM [PR #47861](https://github.com/vllm-project/vllm/pull/47861), *"Fix MTP prefix cache
+correctness for hybrid Mamba models"*, is an **unmerged draft**, and 0.27.1 is still the
+newest release — so whatever it describes is live in every current build. It reports that MTP
+speculative decoding combined with prefix caching on hybrid Mamba/GDN models misaligns
+cache-hit lengths between the attention group and the mamba group, producing *"tool-call
+leakage, recall failures and degenerate generations on cache-hit paths"*.
+
+That is exactly this configuration. And a normal eval will not catch it, because a normal eval
+sends fresh prompts — it never takes the cache-hit path.
+
+`cachehit-eval.py` in this repo tests it directly. It runs an identical probe set twice
+against an identical 13K-token codebase prefix: once with a unique leading salt (which
+guarantees a cache **miss**, since vLLM matches from the first token) and once shared
+(guaranteed **hit**), scraping `/metrics` to prove which path each pass actually took.
+
+| | COLD pass | HOT pass |
+|---|---|---|
+| Prefix cache hit rate | **0.0%** | **86.3%** |
+| Needle retrieval from the prefix | 9/9 | 9/9 |
+| Code generation, unit-tested | 6/6 | 6/6 |
+| Tool calls (valid + correct args) | 3/3 | 3/3 |
+| Max repetition score | 0.046 | 0.063 |
+| **Total** | **18/18** | **18/18** |
+
+**No regression on the cache-hit path.** The reported corruption does not manifest on
+Qwen3.8-27B at this configuration. Prefix caching stays on.
+
+Two notes for anyone re-running this. The needle probes returned in 0.7-1.0s hot versus
+2.6-2.8s cold, which is independent behavioural confirmation that the cache was live —
+useful because vLLM 0.27.1 does not populate `prompt_tokens_details.cached_tokens` on this
+path, so per-request `cached_tokens` reads `None` even on a hit. And give the code probes a
+real output budget: at 3,000 tokens they cap out mid-function and score as failures that are
+the harness's fault, not the model's. 7,000 is enough.
+
+Re-run it with: `/opt/qwen38/venv/bin/python cachehit-eval.py --samples 3 --effort medium`
+To A/B against no caching at all: `NO_PREFIX=1 bash serve-wsl.sh`.
+
+## Accuracy validation
+
+`codeeval.py` is an objective harness, not a vibe check: 8 non-trivial problems (interval
+merging, version comparison, topological sort, token-bucket rate limiter, unified-diff patch
+application, LRU+TTL cache, JSON path query, wildcard matcher), each scored by **executing a
+real test suite** against the model's output. The suites were validated against reference
+implementations first, so a failure can only be the model's.
+
+On the production config: **24/24 code problems, 3/3 tool-call JSON validity, 2/2 long-context
+planted-bug retrieval.** Re-run after raising the window to 104K: **24/24, 3/3, 2/2 again**, and
+the cache-hit probe re-scored **12/12 cold and 12/12 hot** at an 82.5% hit rate. Accuracy is not
+the constraint on this setup — memory and scheduling are.
+
+Run it yourself: `/opt/qwen38/venv/bin/python codeeval.py --tag mytest --samples 3`
 
 ## Battle log — setup problems, already solved
 
@@ -549,116 +727,6 @@ a wait loop that blocks until `nvidia-smi` reports under 3,000 MiB used.
   tool-enabled request. If you ever see malformed tool calls in Cline, this is the targeted fix.
 - **bf16 KV cache "for long-context quality".** fp8 scored 8/8 needle retrieval at both 40K
   and 88K. The reported degradation does not manifest here, and bf16 would halve your context.
-
-## Accuracy validation
-
-`codeeval.py` is an objective harness, not a vibe check: 8 non-trivial problems (interval
-merging, version comparison, topological sort, token-bucket rate limiter, unified-diff patch
-application, LRU+TTL cache, JSON path query, wildcard matcher), each scored by **executing a
-real test suite** against the model's output. The suites were validated against reference
-implementations first, so a failure can only be the model's.
-
-On the production config: **24/24 code problems, 3/3 tool-call JSON validity, 2/2 long-context
-planted-bug retrieval.** Re-run after raising the window to 104K: **24/24, 3/3, 2/2 again**, and
-the cache-hit probe re-scored **12/12 cold and 12/12 hot** at an 82.5% hit rate. Accuracy is not
-the constraint on this setup — memory and scheduling are.
-
-Run it yourself: `/opt/qwen38/venv/bin/python codeeval.py --tag mytest --samples 3`
-
-## Is prefix caching safe here? (vLLM #47861)
-
-vLLM [PR #47861](https://github.com/vllm-project/vllm/pull/47861), *"Fix MTP prefix cache
-correctness for hybrid Mamba models"*, is an **unmerged draft**, and 0.27.1 is still the
-newest release — so whatever it describes is live in every current build. It reports that MTP
-speculative decoding combined with prefix caching on hybrid Mamba/GDN models misaligns
-cache-hit lengths between the attention group and the mamba group, producing *"tool-call
-leakage, recall failures and degenerate generations on cache-hit paths"*.
-
-That is exactly this configuration. And a normal eval will not catch it, because a normal eval
-sends fresh prompts — it never takes the cache-hit path.
-
-`cachehit-eval.py` in this repo tests it directly. It runs an identical probe set twice
-against an identical 13K-token codebase prefix: once with a unique leading salt (which
-guarantees a cache **miss**, since vLLM matches from the first token) and once shared
-(guaranteed **hit**), scraping `/metrics` to prove which path each pass actually took.
-
-| | COLD pass | HOT pass |
-|---|---|---|
-| Prefix cache hit rate | **0.0%** | **86.3%** |
-| Needle retrieval from the prefix | 9/9 | 9/9 |
-| Code generation, unit-tested | 6/6 | 6/6 |
-| Tool calls (valid + correct args) | 3/3 | 3/3 |
-| Max repetition score | 0.046 | 0.063 |
-| **Total** | **18/18** | **18/18** |
-
-**No regression on the cache-hit path.** The reported corruption does not manifest on
-Qwen3.8-27B at this configuration. Prefix caching stays on.
-
-Two notes for anyone re-running this. The needle probes returned in 0.7-1.0s hot versus
-2.6-2.8s cold, which is independent behavioural confirmation that the cache was live —
-useful because vLLM 0.27.1 does not populate `prompt_tokens_details.cached_tokens` on this
-path, so per-request `cached_tokens` reads `None` even on a hit. And give the code probes a
-real output budget: at 3,000 tokens they cap out mid-function and score as failures that are
-the harness's fault, not the model's. 7,000 is enough.
-
-Re-run it with: `/opt/qwen38/venv/bin/python cachehit-eval.py --samples 3 --effort medium`
-To A/B against no caching at all: `NO_PREFIX=1 bash serve-wsl.sh`.
-
-## Vision: what it actually costs (measured, 3 boots)
-
-Qwen3.8-27B is a VL model. The default config passes `--language-model-only`, which drops the
-vision tower. Whether that's the right call changed once we pinned the KV pool by bytes, so it
-was re-measured rather than assumed.
-
-**The vision tower is bf16 — unsloth did not quantize it to NVFP4.** 333 tensors, 0.92GB on
-disk, ~1.14GB resident. You pay full price for it.
-
-| | Default (vision off) | Vision @ KV 5.0GB | Vision @ KV 4.4GB |
-|---|---|---|---|
-| KV pool | 113,624 tok | **113,624 tok** | 99,580 tok |
-| Context | 96K | 96K | 96K (pool still > window) |
-| VRAM at boot | 28,436 MiB | 29,575 MiB | 28,815 MiB |
-| Free floor under load | 2,601 MiB | **2,040 MiB** | **2,615 MiB** |
-| Short decode | 114.5 tok/s | 108.6 | 112.8 |
-| 30K first token, cold | 8.98s | 11.07s | 11.03s |
-| **30K first token, cached** | **3.58s** | **5.24s** | **5.26s** |
-| 4-way concurrent | 105.0 | 101.1 | 100.6 |
-| Reads a screenshot correctly | n/a | n/a | **2/2** |
-
-Three things worth pulling out of that table:
-
-1. **Context does not shrink.** With `--kv-cache-memory-bytes` pinned, the pool is fixed and
-   the vision tower comes out of headroom instead. Older advice (including an earlier version
-   of this README) said vision costs context — that was true only under percentage-based
-   sizing.
-2. **KV 4.4GB fully recovers the memory headroom** (2,615 MiB, matching the vision-off
-   baseline) while keeping 96K context, because 99,580 still exceeds the 98,304 window.
-3. **But cached first-token does not recover.** 5.24s at KV 5.0 and 5.26s at KV 4.4 against a
-   3.58s baseline — nearly identical across two very different memory profiles. So that ~46%
-   regression is **not** memory pressure; it is the cost of having the multimodal path active
-   at all. You cannot tune it away by resizing the pool.
-
-Image tokens are not free either. At patch size 16 with 2x2 spatial merge, an image costs
-roughly `(w/16 x h/16) / 4` tokens: ~305 for a small 760x420 crop, but **~3,600 for a
-full 2560x1440 screenshot**. Crop before pasting.
-
-**Recommendation: keep it as a profile, not a default.** `START-VISION.bat` launches the
-KV 4.4GB variant for when you need to paste a mockup or an error screenshot; `START-QWEN.bat`
-stays lean for coding. Verify vision end-to-end with `vision-probe.py`, which renders a
-synthetic stack-trace screenshot and checks that two planted values come back exactly.
-
-## Profiles
-
-| Command | Context | Slots | Use |
-|---|---|---|---|
-| `START-QWEN.bat` (default) | 104K | 1 | Daily driver. Every benchmark above was measured on this |
-| `START-SHARED.bat` | 60K | 4 | Two people / parallel agents. Lower context so 4 slots fit the pool |
-| `START-VISION.bat` | 96K | 1 | Screenshots / mockups. Costs ~1.7s on cached first-token |
-| `CTX=49152 bash serve-wsl.sh` | 48K | 1 | Heavy desktop use (wallpaper tools, a game idling) |
-
-Whatever you change, leave `MNBT` at 2048 on a 32GB card and keep `KV_BYTES` pinned. Note that
-raising `SEQS` without lowering `CTX` doesn't buy real concurrency: 4 slots x 96K would need
-393K tokens of KV against a 113K pool, so requests just queue.
 
 ## Remote access (optional)
 
