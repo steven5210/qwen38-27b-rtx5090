@@ -36,7 +36,7 @@ if [ "${DESKTOP_MB:-0}" -gt 1300 ]; then
   echo "!!! Windows pages GPU memory and speed collapses. Close Wallpaper Engine / Chrome / games."
   sleep 10
 fi
-CTX="${CTX:-98304}"      # 96K, validated
+CTX="${CTX:-106496}"     # 104K. Usable prompt = 106496 - your max_output
 UTIL="${UTIL:-0.90}"     # ceiling only; the KV pool is pinned by KV_BYTES below
 SEQS="${SEQS:-1}"
 SPEC="${SPEC:-1}"

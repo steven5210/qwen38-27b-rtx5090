@@ -1,7 +1,7 @@
 # Qwen3.8-27B on a single RTX 5090 — a validated, one-click local setup
 
 Runs **Qwen3.8-27B (unsloth NVFP4)** on **vLLM 0.27.1** under WSL2, tuned and measured on a
-desktop RTX 5090 (SM120, 32GB). OpenAI-compatible API with thinking, tool calling, **96K
+desktop RTX 5090 (SM120, 32GB). OpenAI-compatible API with thinking, tool calling, **104K
 context**, MTP speculative decoding, and prefix caching.
 
 Every flag in here exists because something broke without it. The battle log is the real value
@@ -15,12 +15,13 @@ All numbers from the validation run on 2026-08-18, production config, bare deskt
 
 | Scenario | Result |
 |---|---|
-| Short coding reply, thinking off | **114.5 tok/s** (111.9 / 118.7 / 112.8) |
+| Short coding reply, thinking off | **115.6 tok/s** |
 | Sustained thinking, 3,000 tokens out | 33.2-33.7s per response |
-| 30K-context reasoning | **131.2 tok/s**, first token 8.98s cold / **3.58s cached** |
-| 4 concurrent streams | 105 tok/s aggregate, 107-120 per stream |
+| 30K-context reasoning | **142.7 tok/s**, first token 7.14s cold / **2.44s cached** |
+| 4 overlapping requests (queued, see note) | 107.9 tok/s aggregate |
 | 60K-context first token | **7.1-7.8s** (was 210.8s before the MNBT fix — see below) |
-| Decode rate across all reasoning-effort levels | 75-102 tok/s |
+| Sustained long code generation with thinking | **89-99 tok/s** |
+| Decode rate across all reasoning-effort levels | 65-116 tok/s (tracks MTP acceptance — see below) |
 | VRAM stability | flat: 29,520 MiB across a 14-minute varied-load run |
 | **Code accuracy** | **24/24** unit-tested problems |
 | **Tool-call validity** | **3/3** |
@@ -58,11 +59,57 @@ Then point any OpenAI-compatible client at:
 Stop with `STOP-QWEN.bat`. Closing the server window also stops it. It does **not** auto-start
 on boot, by design.
 
+## The cap is prompt + output, not prompt
+
+This is the single most misread number in the whole setup. `--max-model-len` bounds
+**prompt + generated tokens together**, so your usable prompt is `max-model-len` minus
+whatever the client sends as `max_tokens`. vLLM says so itself when you cross it:
+
+> "you requested 16384 output tokens and your prompt contains at least 90113 input tokens,
+> for a total of at least 106497 tokens"
+
+Measured on this build — perfectly linear, no slack:
+
+| Prompt | max_tokens | Result |
+|---|---|---|
+| 89,371 | 16,384 | accepted (sum 105,755) |
+| 90,113 | 16,384 | **rejected** |
+| 103,555 | 2,048 | accepted |
+
+So with the recommended 16,384 output budget:
+
+| max-model-len | Usable prompt |
+|---|---|
+| 98,304 (old default) | 81,920 |
+| **106,496 (current)** | **90,112** |
+
+Which is why the window was raised. It costs +274 MiB of workspace and the KV pool actually
+grows slightly (115,587 vs 113,624, block-size rounding); what shrinks is the pool's *surplus*
+over the window, 15,320 → 9,091 tokens, which showed up as +0.29s on cached first-token while
+cold prefill got 1.8s **faster**. Net, close to a wash for +8,192 usable prompt tokens.
+
+Note this reverses an older rule from this project. Under percentage-based sizing, raising
+`max-model-len` shrank the pool so hard that 88K wouldn't boot. Pinning the pool with
+`--kv-cache-memory-bytes` removed that coupling entirely.
+
+**Don't push to 110K.** The ceiling would reach 96,256, but Cline compacts at ~81% of its
+configured window — at 96,000 that's a ~77,800-token peak, already 12,300 below the current
+ceiling. You would pay real latency (surplus collapsing to ~2,950 tokens) for headroom the
+client structurally never reaches.
+
+### About that "4 overlapping requests" row
+
+The default profile runs `--max-num-seqs 1`, so those four requests **queue** — that number is
+throughput while working through a backlog, not four parallel streams. It is kept as a
+regression signal because Cline really does overlap requests (a normal turn arriving while an
+auto-condense call is in flight), and it catches scheduler pathologies. It does **not** mean
+this profile serves four users; use `START-SHARED.bat` for that.
+
 ## Client settings (Cline / Roo / Continue / any OpenAI client)
 
 | Setting | Value | Why |
 |---|---|---|
-| Context Window Size | **86000** | Client token estimators undercount Qwen's tokenizer; the margin below 98,304 prevents truncated turns |
+| Context Window Size | **96000** | Cline compacts at ~81% of this (~77,800 tokens), leaving ~12,300 of margin under the 90,112 hard prompt ceiling. See "the cap is prompt + output" |
 | Max Output Tokens | **16384** | Thinking shares this budget — starving it truncates turns mid-tool-call |
 | Temperature | **1.0, explicitly set** | Some clients send 0 by default; greedy decoding makes thinking models loop |
 | Reasoning Effort | **medium** | Default is `xhigh`. See the effort section below — this is the single biggest quality-of-life setting |
@@ -77,7 +124,7 @@ values (0.95 / 20 / 0). The server never overrides client-sent values; it only f
 vllm serve unsloth/Qwen3.8-27B-NVFP4
   --served-model-name qwen3.8-27b
   --host 0.0.0.0 --port 8000 --api-key <api-key.txt>
-  --max-model-len 98304                 # 96K context
+  --max-model-len 106496                # 104K. Usable PROMPT = this minus your max_output
   --kv-cache-dtype fp8_e4m3             # halves KV cost; quality-validated (see below)
   --gpu-memory-utilization 0.90         # ceiling only; the KV pool is pinned explicitly
   --kv-cache-memory-bytes 5000000000    # 5.0 GB -> 113,624-token pool. THE determinism knob
@@ -100,6 +147,36 @@ Every value is an environment variable override, no editing required:
 Env the script sets for you: `HF_HOME`, `CUDA_HOME` pointing at the venv's cu13,
 `MAX_JOBS=4`, `NVCC_THREADS=2`, persistent FlashInfer-autotune and Triton cache dirs (this is
 what makes warm boots 2.5 min instead of 5), and `VLLM_ENGINE_READY_TIMEOUT_S=1800`.
+
+## MTP speculative decoding: what acceptance actually looks like
+
+`num_speculative_tokens: 3` means the MTP head proposes 3 tokens per step and the main model
+verifies them. Accepted tokens are free throughput; rejected ones are wasted compute. Measured
+per workload from vLLM's own counters (`vllm:spec_decode_*`):
+
+| Workload | Acceptance | Mean accepted per draft | Decode |
+|---|---|---|---|
+| Short codegen, thinking off | **96.3%** | 2.89 of 3 | fastest |
+| Long code generation, effort medium | 58.5% | 1.75 of 3 | 88.9 tok/s |
+| Cached repeat of that same task | 58.0% | 1.74 of 3 | 89.2 tok/s |
+| Deep reasoning, effort xhigh | **34.0%** | 1.02 of 3 | 65.4 tok/s |
+| **Lifetime across a mixed session** | **67.8%** | **2.03 of 3** | — |
+
+Per draft position, lifetime: position 0 accepted **82.3%**, position 1 **66.8%**,
+position 2 **54.2%**.
+
+Two things fall out of this:
+
+1. **This is the hard evidence for depth 3 over depth 2.** The third draft position still lands
+   more than half the time across a real workload mix. Dropping to 2 forfeits that outright,
+   which is exactly what the earlier head-to-head measured (depth 3 was 27% faster).
+2. **Acceptance is the mechanism behind the effort/speed relationship.** Deep reasoning isn't
+   slower merely because it emits more tokens — it emits *less predictable* tokens, so
+   acceptance collapses from 96% to 34% and per-token speed falls with it. Structured code is
+   highly predictable to the draft head; open-ended reasoning is not.
+
+Note that prefix caching does not change acceptance (58.0% cached vs 58.5% uncached) — the two
+optimizations are independent. Reproduce with `specstats.py`.
 
 ## The one rule that matters: keep desktop VRAM low
 
@@ -312,7 +389,8 @@ a wait loop that blocks until `nvidia-smi` reports under 3,000 MiB used.
 - **`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`.** Redundant once the KV pool is pinned by
   bytes; it only affects the profiler's estimate, which no longer decides anything.
 - **Speculative depth 2** (a popular recommendation): measurably worse. Depth 3 was 27% faster
-  than depth 2 on single-stream work and 64% faster than depth 1. Keep 3.
+  than depth 2 on single-stream work and 64% faster than depth 1 — and the acceptance counters
+  say why: draft position 2 still lands 54.2% of the time. Keep 3.
 - **Disabling prefix caching** to avoid its experimental memory growth: costs 8.98s vs 3.58s
   on every repeat turn at 30K and saves nothing once MNBT is correct.
 - **Swapping in the [froggeric "fixed" chat template](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates)
@@ -359,7 +437,9 @@ real test suite** against the model's output. The suites were validated against 
 implementations first, so a failure can only be the model's.
 
 On the production config: **24/24 code problems, 3/3 tool-call JSON validity, 2/2 long-context
-planted-bug retrieval.** Accuracy is not the constraint on this setup — memory and scheduling are.
+planted-bug retrieval.** Re-run after raising the window to 104K: **24/24, 3/3, 2/2 again**, and
+the cache-hit probe re-scored **12/12 cold and 12/12 hot** at an 82.5% hit rate. Accuracy is not
+the constraint on this setup — memory and scheduling are.
 
 Run it yourself: `/opt/qwen38/venv/bin/python codeeval.py --tag mytest --samples 3`
 
@@ -449,7 +529,7 @@ synthetic stack-trace screenshot and checks that two planted values come back ex
 
 | Command | Context | Slots | Use |
 |---|---|---|---|
-| `START-QWEN.bat` (default) | 96K | 1 | Daily driver. Every benchmark above was measured on this |
+| `START-QWEN.bat` (default) | 104K | 1 | Daily driver. Every benchmark above was measured on this |
 | `START-SHARED.bat` | 60K | 4 | Two people / parallel agents. Lower context so 4 slots fit the pool |
 | `START-VISION.bat` | 96K | 1 | Screenshots / mockups. Costs ~1.7s on cached first-token |
 | `CTX=49152 bash serve-wsl.sh` | 48K | 1 | Heavy desktop use (wallpaper tools, a game idling) |
