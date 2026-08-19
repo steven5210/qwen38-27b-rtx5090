@@ -111,7 +111,7 @@ on boot, by design.
 
 | Setting | Value | Why |
 |---|---|---|
-| Context Window Size | **96000** | Cline compacts at ~81% of this (~77,800 tokens), leaving ~12,300 of margin under the 90,112 hard prompt ceiling. See "the cap is prompt + output" |
+| Context Window Size | **96000** | Keeps the peak prompt under the 90,112 hard ceiling with margin: even a worst-case 90% condense trigger peaks near ~86,400, and the recommended 60% auto-condense leaves far more. See "the cap is prompt + output" |
 | Max Output Tokens | **16384** | Thinking shares this budget — starving it truncates turns mid-tool-call |
 | Temperature | **1.0, explicitly set** | Some clients send 0 by default; greedy decoding makes thinking models loop |
 | Reasoning Effort | **medium** | Default is `xhigh`. See the effort section below — this is the single biggest quality-of-life setting |
@@ -153,8 +153,11 @@ Note this reverses an older rule from this project. Under percentage-based sizin
 `max-model-len` shrank the pool so hard that 88K wouldn't boot. Pinning the pool with
 `--kv-cache-memory-bytes` removed that coupling entirely.
 
-**Don't push to 110K.** The ceiling would reach 96,256, but Cline compacts at ~81% of its
-configured window — at 96,000 that's a ~77,800-token peak, already 12,300 below the current
+**Don't push to 110K.** The ceiling would reach 96,256, but Cline condenses well before
+filling its configured window. (The exact trigger varies by Cline version and by your
+auto-condense setting; a widely repeated ~81% figure could not be verified against Cline's
+source, so this repo does not rely on it.) At 96,000 even a worst-case 90% trigger peaks
+near ~86,400 — under the current
 ceiling. You would pay real latency (surplus collapsing to ~2,950 tokens) for headroom the
 client structurally never reaches.
 
@@ -175,7 +178,7 @@ vllm serve unsloth/Qwen3.8-27B-NVFP4
   --max-model-len 106496                # 104K. Usable PROMPT = this minus your max_output
   --kv-cache-dtype fp8_e4m3             # halves KV cost; quality-validated (see below)
   --gpu-memory-utilization 0.90         # ceiling only; the KV pool is pinned explicitly
-  --kv-cache-memory-bytes 5000000000    # 5.0 GB -> 113,624-token pool. THE determinism knob
+  --kv-cache-memory-bytes 5000000000    # 5.0 GB, pinned. THE determinism knob (pool: 115,587 at the 104K default)
   --max-num-seqs 1                      # single-user profile; raise for shared use
   --max-num-batched-tokens 2048         # THE fix. Was 12288. See "the silent 27x slowdown"
   --language-model-only                 # drops the vision tower, frees ~1-3GB (coding use)
@@ -309,8 +312,16 @@ both of which were measured cleanly on every run.)
 pool comfortably exceeds the 98,304 context window, and that surplus is what powers prefix
 caching (4.18s cached vs 8.98s cold at 30K).
 
-Boot is now reproducible: `GPU KV cache size: 113,624`, `vram_boot=28,436` — matched across
-independent boots to within 80 MiB.
+Boot is now reproducible — matched across independent boots to within ~80 MiB. Note the
+sweep above ran at the earlier 96K window; the signature to check depends on the profile:
+
+| Window | Boot log shows | vram_boot |
+|---|---|---|
+| **104K (shipped default)** | **`GPU KV cache size: 115,587`** | ~28,555 MiB |
+| 96K (the sweep above, START-VISION base) | `GPU KV cache size: 113,624` | ~28,436 MiB |
+
+Same 5.0 GB pin in both — the pool token count shifts slightly with the window because block
+sizes round differently. If your boot line shows one of these two numbers, nothing has drifted.
 
 ---
 
@@ -457,6 +468,9 @@ Two conclusions, and they point opposite ways:
    | 32,768 | 90,000 | 6,000 |
    | 48,000 | 70,000 | 26,000 |
    | 64,000 | 50,000 | 46,000 |
+
+   (The window values assume Cline condenses before its configured window fills; the exact
+   trigger is version-dependent — see the caveat in "The cap is prompt + output".)
 
    Even 48,000 — a quarter of your context window — was not enough for `cont_frac`. And medium
    solved that same problem in **3,405 tokens and 36 seconds**, a 14x token multiplier in

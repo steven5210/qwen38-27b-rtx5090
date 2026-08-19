@@ -10,7 +10,7 @@ xhigh reliably finishes.
   ask-xhigh.py --file question.txt
   ask-xhigh.py --file bug.py --effort medium --max-tokens 30000
 """
-import argparse, json, os, sys, time, urllib.request
+import argparse, json, os, sys, time, urllib.request, urllib.error
 D=os.path.dirname(os.path.abspath(__file__))
 KEY=open(os.path.join(D,"api-key.txt")).read().strip()
 BASE=os.environ.get("QWEN_URL","http://127.0.0.1:8000")
@@ -21,7 +21,7 @@ def main():
     ap.add_argument("--file", action="append", default=[], help="attach a file (repeatable)")
     ap.add_argument("--effort", default="xhigh", choices=["xhigh","medium","low","off"])
     ap.add_argument("--max-tokens", type=int, default=90000)
-    ap.add_argument("--temp", type=float, default=1.0)
+    ap.add_argument("--temp", type=float, default=None, help="override sampling temperature")
     a=ap.parse_args()
 
     parts=[]
@@ -36,24 +36,59 @@ def main():
         print("nothing to ask. give a question or --file", file=sys.stderr); sys.exit(1)
     prompt=("\n\n".join(parts)+"\n\n"+q).strip()
 
-    body=dict(model="qwen3.8-27b", temperature=a.temp, top_p=0.95,
+    body=dict(model="qwen3.8-27b",
               max_tokens=a.max_tokens, stream=True,
               # ask for real usage: counting stream deltas undercounts badly, and this build
               # does not reliably split reasoning_content in streaming mode
               stream_options={"include_usage": True},
               messages=[{"role":"user","content":prompt}])
     if a.effort == "off":
-        # thinking disabled entirely -- a separate mechanism from reasoning_effort
+        # thinking disabled entirely -- a separate mechanism from reasoning_effort.
+        # Qwen3.8 model card recommends DIFFERENT sampling for non-thinking mode:
+        # temperature=0.7, top_p=0.80, presence_penalty=1.5 (vs 1.0/0.95 for thinking).
         body["chat_template_kwargs"] = {"enable_thinking": False}
+        body["temperature"] = a.temp if a.temp is not None else 0.7
+        body["top_p"] = 0.80
+        body["presence_penalty"] = 1.5
     else:
         body["reasoning_effort"] = a.effort
+        body["temperature"] = a.temp if a.temp is not None else 1.0
+        body["top_p"] = 0.95
     req=urllib.request.Request(BASE+"/v1/chat/completions", data=json.dumps(body).encode(),
         headers={"Content-Type":"application/json","Authorization":"Bearer "+KEY})
 
+    # Pre-flight: the server enforces prompt + max_tokens <= 106,496 (measured exactly).
+    # chars/3 over-estimates tokens for code, which errs on the safe side here.
+    est_prompt = len(prompt) // 3 + 300
+    if est_prompt + a.max_tokens > 106_000:
+        new_max = 106_000 - est_prompt
+        if new_max < 2_000:
+            print("!! attachment too large: ~%d tokens estimated; even a minimal answer" % est_prompt)
+            print("!! budget will not fit the 106,496-token window. Trim the file and retry.")
+            sys.exit(1)
+        print("note: large prompt (~%d tokens est) -> lowering max_tokens %d -> %d to fit the window"
+              % (est_prompt, a.max_tokens, new_max))
+        a.max_tokens = new_max
+        body["max_tokens"] = new_max
     print("effort=%s  max_tokens=%s  prompt~%d chars" % (a.effort, a.max_tokens, len(prompt)))
     print("(xhigh commonly runs 4-10 minutes; thinking is shown dimmed as it happens)\n")
     t0=time.time(); n=0; thinking=0; answering=False; last=t0; usage=None; first_tok=None
-    with urllib.request.urlopen(req, timeout=3600) as r:
+    try:
+        resp = urllib.request.urlopen(req, timeout=3600)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try: detail = json.loads(detail)["error"]["message"]
+        except Exception: pass
+        print("\n!! request rejected (HTTP %s): %s" % (e.code, detail))
+        if "maximum context length" in str(detail):
+            print("   Prompt + max_tokens must fit in 106,496 total.")
+            print("   Fix: shrink the attachment, or rerun with a lower --max-tokens.")
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print("\n!! could not reach the server at %s (%s)" % (BASE, getattr(e, "reason", e)))
+        print("   Is it running? Start it with START-QWEN.bat and wait for 'startup complete'.")
+        sys.exit(1)
+    with resp as r:
         for raw in r:
             line=raw.decode("utf-8","replace").strip()
             if not line.startswith("data: "): continue
