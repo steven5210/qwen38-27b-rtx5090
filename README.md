@@ -148,6 +148,49 @@ Env the script sets for you: `HF_HOME`, `CUDA_HOME` pointing at the venv's cu13,
 `MAX_JOBS=4`, `NVCC_THREADS=2`, persistent FlashInfer-autotune and Triton cache dirs (this is
 what makes warm boots 2.5 min instead of 5), and `VLLM_ENGINE_READY_TIMEOUT_S=1800`.
 
+## How much room does xhigh actually need? (and why no setting fixes it)
+
+The natural follow-up to the section below: every xhigh failure was truncation, so does a
+bigger output budget fix it? The honest answer required measuring where xhigh *naturally
+stops* rather than repeatedly capping it. Given a 48,000-token ceiling and a realistic ~20.5K
+coding prompt:
+
+| Problem | Natural stop | Time | Result |
+|---|---|---|---|
+| lru_ttl | 15,493 | 237s | pass |
+| lru_ttl (2nd sample) | 21,500 | 275s | pass |
+| schedule | 25,686 | 341s | pass |
+| wildcard_match | 41,356 | 571s | pass |
+| cont_frac | **>48,000** | 612s | **truncated — nothing usable** |
+
+Median 23,593. **Range 15.5K to beyond 48K for the same class of task — a 3x+ spread.**
+
+Two conclusions, and they point opposite ways:
+
+1. **xhigh's reasoning is fine.** 4 of 5 passed once it wasn't starved, and the one failure was
+   again truncation, not a wrong answer. The earlier 9/24 was an artifact of a 6,000-token cap.
+   Qwen's own model card explains why: it specifies **262,144 tokens for reasoning content**.
+   Every practical budget on a 32GB card is a small fraction of the design point.
+2. **No client setting makes it reliable here.** Because `max-model-len` bounds prompt +
+   output together, buying output room costs context:
+
+   | Max Output | Safe Cline context window | Cost vs 96,000 |
+   |---|---|---|
+   | 16,384 (default here) | 96,000 | — |
+   | 32,768 | 90,000 | 6,000 |
+   | 48,000 | 70,000 | 26,000 |
+   | 64,000 | 50,000 | 46,000 |
+
+   Even 48,000 — a quarter of your context window — was not enough for `cont_frac`. And medium
+   solved that same problem in **3,405 tokens and 36 seconds**, a 14x token multiplier in
+   medium's favour, with medium being the one that got it right.
+
+**Verdict: medium for all agent and coding work.** The cost of xhigh is not merely slowness;
+it is unbounded and unpredictable slowness, on a budget you cannot make large enough without
+gutting your context. Reserve xhigh for a deliberate single hard question in a chat window
+where you can raise `max_tokens` to 60,000+, keep the prompt small, and wait ten minutes —
+and accept that some problems still will not finish.
+
 ## Do NOT use reasoning_effort xhigh for agent coding
 
 The template's default is `xhigh`, and that default is actively harmful for coding work. This
@@ -197,8 +240,33 @@ them.
 
 **Set `reasoning_effort: medium` explicitly in every client.** Leaving it unset gives you
 xhigh, because that is the template default — this is the single most impactful client setting
-on the whole stack. Save xhigh for one-off hard problems in a chat window where a four-minute
-answer and a possible retry are acceptable. It has no place in an agent loop.
+on the whole stack. See the section above for why no output-budget setting rescues xhigh on
+32GB, and what the one legitimate use for it is.
+
+### A note on the thinking_token_budget escape hatch
+
+vLLM 0.27.1 does support `thinking_token_budget` (a top-level chat-completions field) which
+caps thinking specifically. It works — a prompt that produced 0 answer characters at
+`max_tokens: 2000` returned a complete 2,561-character answer with `thinking_token_budget: 300`.
+But swept against medium as a control it never wins:
+
+| Arm | Score | Wall |
+|---|---|---|
+| **medium** | **8/8** | **307s** |
+| xhigh + budget 2,500 | 2/8 | 378s |
+| xhigh + budget 4,000 | 4/8 | 694s |
+| xhigh + budget 6,000 | 6/8 | 1,040s |
+| xhigh + budget 8,000 | 6/8 (plateau) | 1,200s |
+
+It also changes the failure mode for the worse: capped-thinking failures return
+`finish_reason: stop` — confidently wrong answers rather than detectably truncated ones.
+
+One caveat if you use it anyway: vLLM issue #44676 reports that on Qwen3.5+ the budget tracker
+does not treat `<tool_call>` as an implicit reasoning end, so it can inject the reasoning-end
+string into the middle of tool-call JSON and poison conversation history. Confirmed present in
+this build (`thinking_budget_state.py` contains zero references to `tool_call`). It did not
+reproduce in 8/8 clean tool calls here, but the issue reports ~0.5% incidence in production —
+a small sample cannot rule it out.
 
 Reproduce with `EVAL_EFFORT=xhigh python codeeval.py --tag xh --samples 3`.
 
