@@ -44,6 +44,7 @@ explain why.
 | `START-QWEN.bat` | daily driver |
 | `STOP-QWEN.bat` | stop |
 | `ASK-XHIGH.bat "question"` | [deep-think mode](#how-much-room-does-xhigh-actually-need-and-why-no-setting-fixes-it) — one hard question, 4-10 min |
+| `ASK-MEDIUM.bat "question"` | quick one-off ask, seconds — try this before xhigh |
 | `START-VISION.bat` | screenshots / mockups |
 | `START-SHARED.bat` | two people, 60K context |
 
@@ -203,6 +204,7 @@ what makes warm boots 2.5 min instead of 5), and `VLLM_ENGINE_READY_TIMEOUT_S=18
 | `START-SHARED.bat` | 60K | 4 | Two people / parallel agents. Lower context so 4 slots fit the pool |
 | `START-VISION.bat` | 96K | 1 | Screenshots / mockups. Costs ~1.7s on cached first-token |
 | `ASK-XHIGH.bat` | n/a | 1 | Deep-think one-off. Small prompt, ~90K output room, 4-10 min |
+| `ASK-MEDIUM.bat` | n/a | 1 | Quick one-off ask at medium. Seconds. Try this first |
 | `CTX=49152 bash serve-wsl.sh` | 48K | 1 | Heavy desktop use (wallpaper tools, a game idling) |
 
 Whatever you change, leave `MNBT` at 2048 on a 32GB card and keep `KV_BYTES` pinned. Note that
@@ -464,15 +466,49 @@ Two conclusions, and they point opposite ways:
 it is unbounded and unpredictable slowness, on a budget you cannot make large enough without
 gutting your context.
 
+### Every output budget we tried, and what happened
+
+The full record, so nobody has to re-derive it:
+
+| `max_tokens` | `thinking_token_budget` | Result | Note |
+|---|---|---|---|
+| 2,000 | none | **0 answer chars** | burned the whole budget thinking |
+| 2,000 | 300 | complete answer, 1,225 tok | the budget mechanism does work |
+| 6,000 | none | **9/24** | the original alarming number — all 15 failures were truncation |
+| 8,000 | 2,500 | 6/8 | on the four problems that had failed |
+| 16,384 | none | **6/12** | Cline's real setting; still truncating |
+| 16,384 | 2,500 | 2/8 | worse — capped thinking gives confidently wrong answers |
+| 16,384 | 4,000 | 4/8 | |
+| 16,384 | 6,000 | 6/8 | |
+| 16,384 | 8,000 | 6/8 | plateau — more budget stopped helping |
+| **48,000** | none | **4/5** | one problem still exceeded it after 612s |
+| 60,000 | none | works | smoke test, small prompt |
+| **90,000** | none | works | `ASK-XHIGH.bat` default |
+| *(medium, for contrast)* | | **24/24 and 8/8** | at 6,000 |
+
+And where xhigh naturally stops when nothing caps it, with a realistic 20.5K prompt:
+**15,493 · 21,500 · 25,686 · 41,356 · >48,000**. Median 23,593.
+
+The shape of that data is the whole argument: there is no single number you can put in a
+client setting that is both large enough for the tail and small enough to leave you any
+context. Only a small prompt escapes the trade.
+
 ### The one place xhigh does work: `ASK-XHIGH.bat`
 
 Rather than degrading your Cline config to accommodate it, use xhigh where it actually fits —
 a *small* prompt, which leaves nearly the whole 106,496-token window free for reasoning:
 
+**Double-click it** — it prompts for an optional file to attach and then your question, so
+you never need a terminal. From a command line it also takes arguments directly:
+
 ```
 ASK-XHIGH.bat "why does this deadlock when two workers retry at once?"
 ASK-XHIGH.bat --file src\worker.py "find the race condition"
 ```
+
+`ASK-MEDIUM.bat` is the same tool at medium effort with a 16,384 budget — seconds instead of
+minutes, and the effort level that won every test here. Reach for that one first; use
+ASK-XHIGH when you have genuinely tried medium and want a second, slower opinion.
 
 With a ~100-token prompt there is room for ~90,000 output tokens — roughly double the largest
 natural stopping point we measured, so it finishes. It streams, shows the thinking gap, and
