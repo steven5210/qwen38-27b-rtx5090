@@ -43,8 +43,8 @@ explain why.
 |---|---|
 | `START-QWEN.bat` | daily driver |
 | `STOP-QWEN.bat` | stop |
-| `ASK-XHIGH.bat "question"` | [deep-think mode](#how-much-room-does-xhigh-actually-need-and-why-no-setting-fixes-it) — one hard question, 4-10 min |
-| `ASK-MEDIUM.bat "question"` | quick one-off ask, seconds — try this before xhigh |
+| **`QWEN-ASK.bat`** | **ask a question — menu of presets, or set effort/budget yourself** |
+| `ASK-MEDIUM.bat` / `ASK-XHIGH.bat` | the same thing without the menu, for scripting |
 | `START-VISION.bat` | screenshots / mockups |
 | `START-SHARED.bat` | two people, 60K context |
 
@@ -465,6 +465,24 @@ Two conclusions, and they point opposite ways:
 **Verdict: medium for all agent and coding work.** The cost of xhigh is not merely slowness;
 it is unbounded and unpredictable slowness, on a budget you cannot make large enough without
 gutting your context.
+
+### `QWEN-ASK.bat` — one launcher, with the numbers attached
+
+Double-click it and pick a mode. Each option shows what it actually costs, measured here, so
+the choice is informed rather than a guess:
+
+| Option | Effort | Budget | When |
+|---|---|---|---|
+| **1 QUICK** | medium | 16,384 | **Recommended.** 24/24 and 8/8 in every test. 20-60s |
+| 2 DEEP THINK | xhigh | 90,000 | One hard problem, small prompt, 4-10 min |
+| 3 FAST | low | 8,192 | Snappier — but `low` is not reliably faster end-to-end |
+| 4 NO THINKING | off | 8,192 | Fastest first token (~0.15s), simple lookups |
+| 5 CUSTOM | your choice | your choice | With reference points printed for each |
+| 6 | — | — | Prints the measured accuracy/speed/acceptance data |
+
+Option 6 exists so the trade-offs live where the decision is made rather than only in this
+file. Measured on one identical question, the effort ladder is visible in the output length
+alone: thinking off 38 tokens, low 142, medium 173.
 
 ### Every output budget we tried, and what happened
 

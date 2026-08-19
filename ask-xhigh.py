@@ -19,7 +19,7 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("question", nargs="*")
     ap.add_argument("--file", action="append", default=[], help="attach a file (repeatable)")
-    ap.add_argument("--effort", default="xhigh", choices=["xhigh","medium","low"])
+    ap.add_argument("--effort", default="xhigh", choices=["xhigh","medium","low","off"])
     ap.add_argument("--max-tokens", type=int, default=90000)
     ap.add_argument("--temp", type=float, default=1.0)
     a=ap.parse_args()
@@ -37,11 +37,16 @@ def main():
     prompt=("\n\n".join(parts)+"\n\n"+q).strip()
 
     body=dict(model="qwen3.8-27b", temperature=a.temp, top_p=0.95,
-              max_tokens=a.max_tokens, reasoning_effort=a.effort, stream=True,
+              max_tokens=a.max_tokens, stream=True,
               # ask for real usage: counting stream deltas undercounts badly, and this build
               # does not reliably split reasoning_content in streaming mode
               stream_options={"include_usage": True},
               messages=[{"role":"user","content":prompt}])
+    if a.effort == "off":
+        # thinking disabled entirely -- a separate mechanism from reasoning_effort
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        body["reasoning_effort"] = a.effort
     req=urllib.request.Request(BASE+"/v1/chat/completions", data=json.dumps(body).encode(),
         headers={"Content-Type":"application/json","Authorization":"Bearer "+KEY})
 
