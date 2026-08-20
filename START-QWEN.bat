@@ -5,5 +5,6 @@ echo Context : 96K, 1 request slot (the profile every benchmark in README.md was
 echo API key : api-key.txt in this folder (auto-generated first run)
 echo Boot ~2.5 min warm / ~5 min first time. Log: logs\serve.log
 echo CLOSING THIS WINDOW STOPS THE SERVER.
+start "Qwen3.8-27B Monitor" /D "%~dp0" MONITOR.bat
 wsl -d Ubuntu-26.04 -u root --cd "%~dp0" -- bash serve-wsl.sh
 pause
