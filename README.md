@@ -1152,8 +1152,9 @@ xhigh session: 150–272 ms turn starts at ~50K context, ~138 tok/s decode.
 - **Custom wrapper script dies instantly at boot** -> if its filename contains `ninfer-serve`
   and it cleans up with `pkill -f ninfer-serve`, it kills itself. Use `pkill -x ninfer-serve`
   (the kit already does).
-- **A FAST side-ask makes the next Cline turn slow once** -> residency-1 continuation cache;
-  one full re-prefill (~10–13 s at 90K), then fast again.
+- **A FAST side-ask makes the next Cline turn slow once** -> you're on a pre-commit-4
+  binary (residency 1). With all four patches applied, Cline and side-asks each keep their own
+  resident (residency = `--max-concurrency`); rerun `nfix4_patch.py`, rebuild, restart.
 
 ### Hand this to an AI agent (copy-paste runbook)
 
