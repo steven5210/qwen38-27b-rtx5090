@@ -4,19 +4,24 @@ Usage: codeeval.py --tag A --samples 3
 Scores are pass/fail against real test suites, not judgement calls."""
 import argparse, json, os, re, subprocess, sys, tempfile, time, urllib.request
 
-KEY = open('/opt/qwen38/api-key.txt').read().strip()
-URL = "http://127.0.0.1:8000/v1/chat/completions"
-
 import os as _os
+# Endpoint overrides so the same eval can score OTHER OpenAI-compatible servers (bake-offs).
+URL   = _os.environ.get("EVAL_URL", "http://127.0.0.1:8000/v1/chat/completions")
+MODEL = _os.environ.get("EVAL_MODEL", "qwen3.8-27b")
+try: KEY = open('/opt/qwen38/api-key.txt').read().strip()
+except Exception: KEY = ""
 DEFAULT_EFFORT=_os.environ.get("EVAL_EFFORT","medium")
+NO_EFFORT=_os.environ.get("EVAL_NO_EFFORT")   # set to omit reasoning_effort (servers without it)
 def chat(messages, max_tokens=6000, effort=None, tools=None, seed=None, temp=1.0):
     effort = effort or DEFAULT_EFFORT
-    body = {"model":"qwen3.8-27b","messages":messages,"max_tokens":max_tokens,
-            "temperature":temp,"top_p":0.95,"reasoning_effort":effort}
+    body = {"model":MODEL,"messages":messages,"max_tokens":max_tokens,
+            "temperature":temp,"top_p":0.95}
+    if not NO_EFFORT: body["reasoning_effort"]=effort
     if seed is not None: body["seed"]=seed
     if tools: body["tools"]=tools; body["tool_choice"]="auto"
-    req=urllib.request.Request(URL,data=json.dumps(body).encode(),
-        headers={"Content-Type":"application/json","Authorization":f"Bearer {KEY}"})
+    hdrs={"Content-Type":"application/json"}
+    if KEY: hdrs["Authorization"]=f"Bearer {KEY}"
+    req=urllib.request.Request(URL,data=json.dumps(body).encode(),headers=hdrs)
     t0=time.perf_counter()
     r=json.load(urllib.request.urlopen(req,timeout=900))
     ch=r["choices"][0]

@@ -46,6 +46,7 @@ explain why.
 | **`QWEN-ASK.bat`** | **ask a question — menu of presets, or set effort/budget yourself** |
 | `ASK-MEDIUM.bat` / `ASK-XHIGH.bat` | the same thing without the menu, for scripting |
 | `START-VISION.bat` | screenshots / mockups |
+| `MONITOR.bat` | live dashboard: boot progress -> READY, KV/cache/acceptance, VRAM paging alarms (auto-opens with START-QWEN) |
 | `START-SHARED.bat` | two people, 60K context |
 
 **The three things that will bite you**
@@ -676,7 +677,10 @@ implementations first, so a failure can only be the model's.
 
 On the production config: **24/24 code problems, 3/3 tool-call JSON validity, 2/2 long-context
 planted-bug retrieval.** Re-run after raising the window to 104K: **24/24, 3/3, 2/2 again**, and
-the cache-hit probe re-scored **12/12 cold and 12/12 hot** at an 82.5% hit rate. Accuracy is not
+the cache-hit probe re-scored **12/12 cold and 12/12 hot** at an 82.5% hit rate. Independently
+reproduced by a second reviewer pass (8/8, 1/1, 2/2 at one sample). `reasoning_effort: low`
+also passes clean — **16/16, 2/2, 2/2** at two samples — making LOW a validated fallback,
+though medium remains the recommended default (LOW is not reliably faster on easy prompts). Accuracy is not
 the constraint on this setup — memory and scheduling are.
 
 Run it yourself: `/opt/qwen38/venv/bin/python codeeval.py --tag mytest --samples 3`
@@ -756,6 +760,13 @@ a wait loop that blocks until `nvidia-smi` reports under 3,000 MiB used.
   shell — child processes inherit it (`unset PYTORCH_CUDA_ALLOC_CONF`).
 - **`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`.** Redundant once the KV pool is pinned by
   bytes; it only affects the profiler's estimate, which no longer decides anything.
+- **"Align `--max-num-batched-tokens` to a multiple of the 1600 block" / "remove
+  `--prefix-match-unit`".** Tested three-armed (2048 baseline vs 3200 aligned vs 3199 with the
+  unit flag removed): hit rates 82.5-86.3% vs 80.8% vs **76.4%**, accuracy 12/12 on all,
+  acceptance identical, and the non-default arms cost +816 and +948 MiB of boot VRAM. The
+  scheduler source already aligns chunk boundaries to the block
+  (`aligned_end = end // block_size * block_size`), so there was no misalignment to fix — and
+  removing the match unit coarsens hit granularity exactly as vLLM's own flag docs predict.
 - **Speculative depth 2** (a popular recommendation): measurably worse. Depth 3 was 27% faster
   than depth 2 on single-stream work and 64% faster than depth 1 — and the acceptance counters
   say why: draft position 2 still lands 54.2% of the time. Keep 3.
@@ -793,6 +804,12 @@ a wait loop that blocks until `nvidia-smi` reports under 3,000 MiB used.
   tool-call validity here is already 3/3 cold and 3/3 on cache-hit paths, so there is no
   measured defect for those guardrails to fix, and they cost ~120 tokens on every
   tool-enabled request. If you ever see malformed tool calls in Cline, this is the targeted fix.
+
+  A derivative template ("Qwen-Sharp": froggeric plus an 11-line terseness system prompt) was
+  also A/B-tested by injecting its exact text as a system message: accuracy 7/8 vs 8/8
+  control, code outputs came out *longer* (avg 2,073 vs 1,549 tokens) and 67% slower, and it
+  did not tame xhigh thinking (its one xhigh completion vs the control's zero is inside the
+  measured coin-flip variance). Styling the answer does not shorten the reasoning.
 - **bf16 KV cache "for long-context quality".** fp8 scored 8/8 needle retrieval at both 40K
   and 88K. The reported degradation does not manifest here, and bf16 would halve your context.
 
