@@ -903,14 +903,17 @@ request-time growth, which is *why* endurance is flat with zero tuning.
 
 ### Cache architecture: continuation vs radix — measured, not assumed
 
-ninfer logs per-request reuse (`cache=` in the completion log; nothing in the API usage
-payload — telemetry gap, patch candidate). The checkpoint battery's per-request sequence
+ninfer logs per-request reuse (`cache=` in the completion log; since fix-branch commit 3
+the same number also reaches the wire as `usage.prompt_tokens_details.cached_tokens`). The checkpoint battery's per-request sequence
 settles the semantics: identical repeat of a recent prompt → near-total reuse (~15.3K of
 15.3K tokens); a *different* question over the same 15.2K document → **zero** reuse. It is a
 **continuation/replay cache** (new prompt must extend or re-play a recent resident sequence),
-not vLLM's serve-any-shared-prefix radix tree, and the resident set is effectively **1**.
+not vLLM's serve-any-shared-prefix radix tree. At evaluation time the resident set was
+effectively **1**; fix-branch commit 4 later made it **= `--max-concurrency`** (see the
+Residency-N section below).
 
-A Cline-shaped TTFT test (8 turns, ~12.5K tokens each) on both stacks:
+A Cline-shaped TTFT test (8 turns, ~12.5K tokens each) on both stacks, **measured before
+commit 4**:
 
 | | growing conversation, late-turn TTFT (87–100K prompts) | two conversations alternating (50K each) |
 |---|---|---|
@@ -921,9 +924,11 @@ Two findings we didn't expect. First, on this hybrid-SSM model a vLLM prefix **h
 costs time linear in conversation length** (SSM state handling) — which is why long Cline
 tasks start turns slower even at 80% hit rates. Second, both stacks degrade on interleaved
 long conversations, just differently: ninfer predictably (one re-prefill, ~13s at 90K), vLLM
-by eviction luck. Practical guidance: keep side-asks small, or accept one slow turn after
-one. The clean fix is an upstream `--resident-prefixes N` (LRU) feature — proposal planned;
-the 252K pool already fits two conversations, it is purely a matching-policy change.
+by eviction luck. That diagnosis held up almost exactly: it *was* purely a matching-policy
+change, and fix-branch commit 4 implements it (retention-aware lane selection — the pool
+already fit two conversations all along). Interleaved late-turn TTFT after the fix: **3.18s**,
+with a 50K interleaved turn indistinguishable from sequential. Details in the Residency-N
+section and `RESIDENCY-DESIGN.md`.
 
 ### Vision & video head-to-head (and the config ceiling)
 
@@ -1009,8 +1014,8 @@ Live validation on the patched binary (full battery, then production restored):
 
 | | before | after |
 |---|---|---|
-| Interleaved A/B late-turn TTFT | 7.5 s (full re-prefill every turn) | **3.18 s** |
-| Interleaved vs sequential @ 50K | 7.5 s vs 4.1 s | **3.42 s vs 3.45 s — identical** |
+| Interleaved A/B late-turn TTFT | 9.0 s (full re-prefill every switch) | **3.18 s** |
+| Interleaved vs sequential @ 50K turn | ~2x sequential (full re-prefill) | **3.42 s vs 3.45 s — identical** |
 | Parity battery | — | toolab 20/20, streamtool 3/3, multiturn 2/2, cache-hit 12/12 "NO REGRESSION" |
 
 JSONL forensics confirm both conversations reusing their full prior context from turn 2
@@ -1110,6 +1115,14 @@ ninfer defaults to loopback-only. Then, in order:
 
 **8. Point Cline at it** — settings below. **9. Rollback** any time: `STOP-NINFER.bat`
 (stops ninfer, boots the vLLM stack, waits for health 200).
+
+**Updating an existing install.** If you cloned this repo as your working folder, `git pull`
+refreshes docs, kit scripts, harnesses, and patchers — but never the engine itself. When a
+pull brings a new `nfixN_patch.py`, apply it and rebuild: run `python3 $W/nfixN_patch.py`,
+rerun step 3's `cmake --build` + unit gates, and the next START-NINFER boots the new binary
+(the running server keeps the old one until then). Patchers are idempotent and assert-guarded,
+so rerunning the full set after a pull is always safe. The model artifact, `api-key.txt`, and
+`/opt/ninfer` are deliberately not in git — they never update via pull.
 
 ### Cline settings (validated optima)
 
