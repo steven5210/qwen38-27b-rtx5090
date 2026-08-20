@@ -997,6 +997,166 @@ TTFT), `conc2big.py` (admission), `endure.py` (`CTX_SIZES` env), `cachehit-eval.
 `phase2b.sh` / `phase2c.sh` / `phase2d.sh` (the exact batteries), `nfix_patch.py` +
 `nfix2_patch.py` (the parser fixes as applied). All honor `TARGET_URL`/`QWEN_URL`/`EVAL_URL`.
 
+## Setting up ninfer from scratch (humans and AI agents)
+
+Everything in this section was executed and verified on this machine — commands are literal,
+expected outputs are stated, and each step has a gate. Follow it top to bottom and there is
+nothing left to guess. Paths assume this repo lives at `C:\Users\StevenPC\Downloads\qwen38`
+(WSL view: `/mnt/c/Users/StevenPC/Downloads/qwen38`) and ninfer lives in `/opt/ninfer` inside
+WSL — adjust both consistently if yours differ.
+
+### Requirements (verified)
+
+- RTX 5090 — ninfer targets `sm_120a` exclusively; no other GPU works
+- WSL2 Ubuntu (we run Ubuntu-26.04) with an NVIDIA driver supporting CUDA 13.1
+- CUDA Toolkit 13.1+ inside WSL (we build with 13.2 at `/usr/local/cuda-13.2`)
+- CMake 3.28+, Ninja, a C++20 host compiler, git, python3
+- ~25 GB free under `/opt` — the model artifact alone is 21.5 GB
+
+### Step by step
+
+**1. Clone and pin.** The three patches below are validated against upstream commit `feaf4dd`;
+newer master usually works, but the patchers are assert-guarded — on anchor drift they refuse
+loudly instead of mis-patching.
+
+    sudo mkdir -p /opt/ninfer && cd /opt/ninfer
+    git clone https://github.com/Neroued/ninfer.git src
+    cd src && git checkout feaf4dd
+
+**2. Apply the validated fixes** (needed until [#66](https://github.com/Neroued/ninfer/issues/66)
+lands upstream — without them, string-declared tool arguments containing JSON break Cline's
+`write_file`, `True` booleans arrive as strings, and no reuse telemetry reaches the API):
+
+    W=/mnt/c/Users/StevenPC/Downloads/qwen38
+    python3 $W/nfix_patch.py     # schema-typed arguments (code)
+    python3 $W/nfix_test.py      # its unit tests + docs note
+    python3 $W/nfix2_patch.py    # vLLM-parity scalar coercion  -> NFIX2_PATCH_OK
+    python3 $W/nfix3_patch.py    # cached_tokens usage telemetry -> NFIX3_PATCH_OK
+
+Each exits 0 and prints progress; rerunning prints "already patched" and changes nothing.
+An `AssertionError` means upstream drifted — stop and reconcile, never hand-edit around it.
+
+**3. Configure, build, unit-test** (the exact configuration this repo's numbers came from):
+
+    cmake -S /opt/ninfer/src -B /opt/ninfer/src/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+      -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc
+    cmake --build /opt/ninfer/src/build --parallel
+    /opt/ninfer/src/build/tests/ninfer_tool_call_parser_test   # must print: ok
+    /opt/ninfer/src/build/tests/ninfer_openai_schema_test      # must print: ok
+
+**4. Model artifact + integrity.** 21.5 GB download; any `hf` CLI works (ours lives in the
+vLLM venv). The SHA-256 is non-negotiable — on mismatch, delete and re-download.
+
+    /opt/qwen38/venv/bin/hf download neroued/Qwen3.8-27B-nvfp4-NInfer \
+      qwen3_8_27b_nvfp4.ninfer --local-dir /opt/ninfer/models
+    sha256sum /opt/ninfer/models/qwen3_8_27b_nvfp4.ninfer
+    # bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32
+
+**5. API key.** One line in `api-key.txt` in the Windows folder (your own secret). It is
+`.gitignore`d — never commit it, never echo it into logs.
+
+**6. Pick a profile** in `ninfer-prod.conf` — these are measured optima, not suggestions:
+
+    CTX=252928  VISION=0   # Option B (default): max text. 9s boot, ~1.0 GB free, 57s @ 173K prefill
+    CTX=152576  VISION=1   # Option A: image+video input. 10s boot, ~2.2 GB free, 41s @ 135K prefill
+    # never VISION=1 with CTX>152576: 192,512 boots but leaves ~0.5 GB free -> 11x slower prefill
+
+**7. Boot + verification ladder.** `START-NINFER.bat` (server + NMON monitor; READY in ~10 s).
+The kit boots with `--host 0.0.0.0` (API-key gated) so Tailscale/LAN clients work — stock
+ninfer defaults to loopback-only. Then, in order:
+
+    W=/mnt/c/Users/StevenPC/Downloads/qwen38
+    curl -s -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $(cat $W/api-key.txt)" \
+      http://127.0.0.1:8080/v1/models                      # 200
+    bash $W/ctokprobe.sh && tail -6 $W/logs/ctokprobe.log  # 2nd request: cached_tokens > 0
+    cd $W && TARGET_URL=http://127.0.0.1:8080/v1/chat/completions \
+      /opt/qwen38/venv/bin/python toolab.py 2>&1 | tail -2 # total=20/20
+    # optional deep check (~5 min):
+    cd $W && TARGET_URL=http://127.0.0.1:8080/v1/chat/completions NEEDLE_SIZES=96000,173000,236000 \
+      /opt/qwen38/venv/bin/python needleprobe.py           # found=3/3 at every size
+
+**8. Point Cline at it** — settings below. **9. Rollback** any time: `STOP-NINFER.bat`
+(stops ninfer, boots the vLLM stack, waits for health 200).
+
+### Cline settings (validated optima)
+
+OpenAI Compatible · Base URL `http://127.0.0.1:8080/v1` (Tailscale: `http://100.119.25.65:8080/v1`)
+· API key from `api-key.txt` · Model ID `qwen3.8-27b`
+
+| | medium — daily driver | xhigh — full capability | vision day (conf Option A) |
+|---|---|---|---|
+| Context window | 252,928 | 252,928 | **152,576** |
+| Max output | 32,768 | **131,072** | 32,768 (49,152 if you want xhigh+vision) |
+| Reasoning effort | medium | xhigh | medium |
+| Usable prompt | ~220K | ~122K | ~120K |
+| Temperature | unset / 1.0 | unset / 1.0 — **never 0**: it overrides the official thinking sampling (1.0 / top-p 0.95) and invites repetition loops on 100K-token thinks | unset / 1.0 |
+
+Keep one effort per task (changing it busts prefix reuse — the instruction lives at the prompt
+head). Expect xhigh turns to think for minutes; that is the trade. Measured on the first live
+xhigh session: 150–272 ms turn starts at ~50K context, ~138 tok/s decode.
+
+### Troubleshooting (every entry actually happened here)
+
+- **NMON says READY but Cline can't connect** -> binding. Stock ninfer listens on `127.0.0.1`
+  only; the kit passes `--host 0.0.0.0`. Tailscale runs *inside* WSL here, so loopback-only
+  means invisible to remote clients.
+- **`--vision` + 252,928 refuses to boot** -> doesn't fit 32 GB. That's physics, use a profile.
+- **Second big concurrent request gets HTTP 503** -> fail-fast admission when the KV pool can't
+  hold both. By design; retry when the first drains. 90K + 30K coexist fine at 252,928.
+- **Custom wrapper script dies instantly at boot** -> if its filename contains `ninfer-serve`
+  and it cleans up with `pkill -f ninfer-serve`, it kills itself. Use `pkill -x ninfer-serve`
+  (the kit already does).
+- **A FAST side-ask makes the next Cline turn slow once** -> residency-1 continuation cache;
+  one full re-prefill (~10–13 s at 90K), then fast again.
+
+### Hand this to an AI agent (copy-paste runbook)
+
+    You are setting up the ninfer inference server for Qwen3.8-27B NVFP4 on an RTX 5090
+    machine running WSL2 Ubuntu. Work strictly step by step. After every step, run its
+    verification gate; if a gate fails, STOP and report the exact output — do not improvise
+    around failures. Never print the API key. Do not change any server flag, sampling value,
+    or config number beyond what is written here: these are measured optima.
+    Paths: Windows folder C:\Users\StevenPC\Downloads\qwen38 = WSL
+    /mnt/c/Users/StevenPC/Downloads/qwen38 (call it $W). Server tree: /opt/ninfer.
+
+    1. PREFLIGHT. Verify and report: nvidia-smi shows RTX 5090; a CUDA toolkit >= 13.1
+       exists under /usr/local/cuda-13*; cmake >= 3.28; ninja; python3; >= 25 GB free
+       under /opt. Any miss -> STOP.
+    2. CLONE. git clone https://github.com/Neroued/ninfer.git /opt/ninfer/src, then
+       cd /opt/ninfer/src && git checkout feaf4dd.
+    3. PATCH. Run in order: python3 $W/nfix_patch.py ; python3 $W/nfix_test.py ;
+       python3 $W/nfix2_patch.py ; python3 $W/nfix3_patch.py. Gate: every one exits 0
+       (progress lines, or "already patched"). An AssertionError -> STOP (upstream drift).
+    4. BUILD. cmake -S /opt/ninfer/src -B /opt/ninfer/src/build -G Ninja
+       -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+       -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc (use your cuda-13.x path),
+       then cmake --build /opt/ninfer/src/build --parallel. Gate: build completes; then
+       /opt/ninfer/src/build/tests/ninfer_tool_call_parser_test and
+       .../ninfer_openai_schema_test each print exactly "ok".
+    5. MODEL. hf download neroued/Qwen3.8-27B-nvfp4-NInfer qwen3_8_27b_nvfp4.ninfer
+       --local-dir /opt/ninfer/models (any hf CLI; 21.5 GB). Gate: sha256sum of the file
+       equals bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32. On
+       mismatch: delete the file and STOP.
+    6. KEY. Ensure $W/api-key.txt exists: exactly one line, no trailing whitespace.
+       Do not display its contents.
+    7. PROFILE. Ensure $W/ninfer-prod.conf contains CTX=252928 and VISION=0 (text
+       default), or CTX=152576 VISION=1 for vision. Never VISION=1 with CTX above 152576.
+    8. BOOT. Interactive: the user double-clicks START-NINFER.bat. Headless:
+       nohup bash $W/ninfer-serve-prod.sh >/dev/null 2>&1 &. Gate: within 60 s,
+       curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(cat $W/api-key.txt)"
+       http://127.0.0.1:8080/v1/models returns 200. If a remote client will connect,
+       also verify the same on the machine's Tailscale/LAN IP.
+    9. TELEMETRY GATE. bash $W/ctokprobe.sh; in $W/logs/ctokprobe.log the first usage
+       shows "cached_tokens": 0 and the second shows cached_tokens > 0.
+    10. TOOL GATE. cd $W && TARGET_URL=http://127.0.0.1:8080/v1/chat/completions
+        /opt/qwen38/venv/bin/python toolab.py (any python3 with stdlib works). Gate:
+        total=20/20.
+    11. OPTIONAL DEEP GATE (~5 min). Same env, NEEDLE_SIZES=96000,173000,236000,
+        run needleprobe.py. Gate: found=3/3 at every size.
+    12. REPORT. Output a table: step, gate, result. State the profile booted, the
+        VRAM used (nvidia-smi), and that rollback is STOP-NINFER.bat. Done.
+
 ## Credits
 
 Built and measured over five days against a real Cline workload. Model by Qwen, NVFP4 quant by
