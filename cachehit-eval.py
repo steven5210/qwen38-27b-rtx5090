@@ -17,7 +17,7 @@ Read-only: changes no server setting.
 """
 import json, os, re, sys, time, argparse, urllib.request, subprocess, tempfile, random
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("QWEN_URL", "http://127.0.0.1:8000")
 KEY  = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "api-key.txt")).read().strip()
 MODEL = "qwen3.8-27b"
 
@@ -241,7 +241,7 @@ def ask(probe, effort="medium", salt=None):
     msgs = [{"role": "user", "content": head + PREFIX + "\n\n---\n\n" + probe["q"]}]
     payload = dict(model=MODEL, messages=msgs, temperature=1.0, top_p=0.95,
                    max_tokens=probe["max_tokens"], stream=False)
-    payload["chat_template_kwargs"] = {"reasoning_effort": effort}
+    payload["reasoning_effort"] = effort   # top-level: works on vLLM and ninfer alike
     if probe["kind"] == "tool":
         payload["tools"] = TOOLS
         payload["tool_choice"] = "auto"

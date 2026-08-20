@@ -838,32 +838,128 @@ benchmarked it head-to-head with the identical eval suite. Measured here, WSL2, 
 | Code accuracy (unit-tested) | **16/16** | 16/16–24/24 |
 | Long-context needles | **3/3 at 96K, 173K and 236K prompt tokens** | validated to ~90K window |
 | Image probe | 2/2 | 2/2 |
-| Tool calls, 20-call A/B | **12/20 — see the schema bug below** | **20/20** |
+| Tool calls, 20-call A/B | **20/20 after our upstreamed fix** (12/20 stock — see below) | **20/20** |
 
-The 236K needle run (106s wall, perfect retrieval, int8 KV) verifies the long-context claim
-on this card. Video input is mechanically functional (it decoded a 6-frame clip and correctly
-described its structure in 1.9s) but could not read small text after frame downscaling — a
-fair readability retest needs large-font content.
+The 236K needle run (perfect retrieval, int8 KV) verifies the long-context claim on this
+card. The early "video can't read text" result was our probe's fault, not the model's — see
+the large-font retest below, where ninfer reads every code and beats vLLM doing it.
 
-**The one real defect — nested-JSON tool arguments.** In 20 tool calls across five content
-shapes, ninfer failed exactly the two JSON-file shapes (0/8) and passed everything else
-(12/12). Root cause, from its own wire responses: when a `write_file` argument declared as
-`type: string` contains JSON, ninfer returns it as a JSON **object** instead of a string —
-`"content": {...}` where the schema says `"content": "..."`. vLLM's parser always yields
-strings (20/20). Any client that trusts the declared schema — Cline writing a `.json` file —
-would break on this. Until fixed upstream, ninfer is not safe as the agent-loop server;
-`.py`/`.sh`/`.md` tool writes were flawless.
+**The schema bug — found, root-caused, fixed, and upstreamed.** In 20 tool calls across
+five content shapes, stock ninfer failed exactly the two JSON-file shapes (0/8) and passed
+everything else. Root cause in `src/serve/tool_call_parser.cpp`: every `<parameter=...>`
+value is typed by *sniffing* (`parsed.is_discarded() ? raw : parsed`) — the request's
+declared tool schema is never consulted, so a `type: string` parameter whose text happens to
+parse as JSON goes out as an object. Cline writing a `.json` file through `write_file` hits
+this on every attempt. We patched it on a fork branch (`fix/schema-typed-tool-arguments`):
 
-**Where ninfer fits in this setup: the FAST path.** `ASK-FAST.bat` (or `QWEN-ASK.bat`
-option 7, or `ask-xhigh.py --fast`) answers one-off questions using whichever server is up —
-and when nothing is running, boots ninfer in ~15 seconds (32K context, int8 KV, MTP3, same
-API key) instead of waiting 2.5 minutes for the full stack. Thinking-off maps to ninfer's
-documented `reasoning_effort: "none"`. `STOP-FAST.bat` shuts it down; it never touches the
-main server. Both cannot run at once — the card fits one 27B resident at a time.
+- **Commit 1** — type parsed values by the declared parameter schema (string-declared values
+  are never promoted; undeclared parameters keep value inference). 20-call matrix: 12/20 → **20/20**.
+- **Commit 2** — the extended battery then caught scalar spellings: `True` for a
+  boolean-declared parameter isn't valid JSON, so it survived as the string `"True"` (vLLM
+  emits `true` there via constrained decoding). We ported vLLM's qwen3coder coercion table:
+  any-case `null` → JSON null, string family verbatim, `int*`/`uint*` strict integral parse
+  with raw fallback, `number`/`float` with integral collapse, boolean any-case `true`/`1`,
+  union types (`["string","null"]`) → first non-null member. Their unit suite passes with 3
+  new tests; a 6-shot live boolean probe returns properly typed
+  `{"drain_first": true, "target_replicas": 7}` every time.
 
-Reproduce any of it: `toolab.py` (tool A/B), `needleprobe.py` (long-context, calibrated via
-the target's own token counter), `vidprobe.py` + `vision-probe.py` (media), all honoring
-`TARGET_URL`/`QWEN_URL` env overrides.
+Upstream: filed as [Neroued/ninfer#66](https://github.com/Neroued/ninfer/issues/66) with the
+repro table and fix design (issue-first per their CONTRIBUTING); PR offered from the branch.
+
+### The full parity battery (Phase 2 — run at both windows)
+
+Same eval suite as the vLLM production stack, patched ninfer, int8 KV, MTP-3, concurrency 2:
+
+| Probe | ninfer @ 106,496 | ninfer @ 252,928 | vLLM production (104K) |
+|---|---|---|---|
+| Coding eval (unit-tested) | **24/24** | **24/24** | 24/24 |
+| Tool-call probes | 3/3 | 3/3 | 3/3 |
+| Long-context probes | 2/2 | 2/2 | 2/2 |
+| Streaming tool calls (Cline mode) | 3/3, zero leaked content | — | 3/3 |
+| Multi-turn tool replay | 2/2 | — | 2/2 |
+| Needles | — | **3/3 at 96K / 173K / 236K** | 3/3 inside its 90K window |
+| Concurrency 2 (two streams) | **288.6 tok/s aggregate** | — | n/a (SEQS=1) |
+| 22-min varied-load endurance | **150 req, 0 errors, wall ratio 0.99, drift 87 MiB** | 47 req, 0 errors, ratio 1.11, drift 172 MiB | flat only after our KV_BYTES pin (stock collapsed 27x) |
+| MTP acceptance (whole run) | 64.0% (68,021/106,334) | — | content-dependent 34–96% |
+| Effort dial (none/low/medium/xhigh) | 0.1s / 21.1s / 40.5s / 16K-cap length | — | same science |
+| Boot to serving | 9–10 s | 9 s | ~2.5 min |
+
+Two operational behaviours worth knowing: requests that cannot fit the KV pool alongside a
+running giant get an immediate **HTTP 503** (fail-fast admission — retry when the first
+drains; at realistic sizes, 90K + 30K coexist fine), and the pool is fixed at boot — no
+request-time growth, which is *why* endurance is flat with zero tuning.
+
+### Cache architecture: continuation vs radix — measured, not assumed
+
+ninfer logs per-request reuse (`cache=` in the completion log; nothing in the API usage
+payload — telemetry gap, patch candidate). The checkpoint battery's per-request sequence
+settles the semantics: identical repeat of a recent prompt → near-total reuse (~15.3K of
+15.3K tokens); a *different* question over the same 15.2K document → **zero** reuse. It is a
+**continuation/replay cache** (new prompt must extend or re-play a recent resident sequence),
+not vLLM's serve-any-shared-prefix radix tree, and the resident set is effectively **1**.
+
+A Cline-shaped TTFT test (8 turns, ~12.5K tokens each) on both stacks:
+
+| | growing conversation, late-turn TTFT (87–100K prompts) | two conversations alternating (50K each) |
+|---|---|---|
+| ninfer | **4.1s** (server logs confirm ~351K tokens reused) | 9.0s — full re-prefill on every switch (residency 1) |
+| vLLM | 5.1s (metrics: 144,000 of 250,988 queried tokens hit) | 9.8s — blows past the 115,587-token pool, eviction pressure |
+
+Two findings we didn't expect. First, on this hybrid-SSM model a vLLM prefix **hit still
+costs time linear in conversation length** (SSM state handling) — which is why long Cline
+tasks start turns slower even at 80% hit rates. Second, both stacks degrade on interleaved
+long conversations, just differently: ninfer predictably (one re-prefill, ~13s at 90K), vLLM
+by eviction luck. Practical guidance: keep side-asks small, or accept one slow turn after
+one. The clean fix is an upstream `--resident-prefixes N` (LRU) feature — proposal planned;
+the 252K pool already fits two conversations, it is purely a matching-policy change.
+
+### Vision & video head-to-head (and the config ceiling)
+
+With a large-font test clip (the honest retest of the earlier artifact):
+
+| | image (stack-trace screenshot) | video (6 planted codes) | vision boot cost |
+|---|---|---|---|
+| ninfer `--vision` | 2/2 + 2/2, **1.9–2.5s** | **12/12 digits across 2 runs, 2.5–4.2s** | boot still ~10s, +2.7 GB fixed |
+| vLLM `VISION=1` | 2/2 + 2/2, 2.8–6.3s | 11/12 (one digit misread), 21.7–29.2s | **boot 252s**, KV pool unchanged |
+
+The vision context ceiling on a 32 GB card is real and sharp (all measured, three configs):
+
+| ninfer config | boots? | free VRAM after startup | 135–173K prefill | verdict |
+|---|---|---|---|---|
+| `--vision` + 252,928 | **no** (doesn't fit) | — | — | impossible |
+| `--vision` + 192,512 | yes | ~0.4–0.5 GB | **620–681s (11x slow)**, image probe flaky | trap — do not use |
+| `--vision` + 152,576 | yes | ~2.2 GB | **41.2s**, needles 3/3, image 2/2 | the vision profile |
+| text-only + 252,928 | yes | ~1.0 GB | 57s @ 173K | the default profile |
+
+The `--media-cache-mib` / `--media-live-mib` knobs bound *payloads*, not the fixed vision
+reservation (tested; they return no VRAM). Net: **vision costs ~100K of context** on this
+card. Both profiles live in `ninfer-prod.conf` (Option B text-max default, Option A vision).
+On the vLLM fallback side, `--limit-mm-per-prompt`, `--mm-processor-kwargs max_pixels`, and
+`--mm-processor-cache-gb` are the equivalent diet levers if its 252s vision boot matters to you.
+
+### Running it for real: the Phase-3 kit
+
+`START-NINFER.bat` boots the validated production profile in ~10 seconds (config in
+`ninfer-prod.conf`, monitor window auto-opens via `nmon.py` — READY state, VRAM alarms,
+reuse tallies, throughput). `STOP-NINFER.bat` is one click back to the vLLM stack.
+Cline settings against ninfer: OpenAI Compatible, base URL `http://127.0.0.1:8080/v1`,
+model `qwen3.8-27b`, context window **252,928**, max output **32,768** → **~220K usable
+prompt, 2.4x the vLLM setup's 90,112**. Full walk-through in `CLINE-NINFER.md`.
+
+xhigh finally has room: the Qwen card's official reasoning budget is 262,144, and our
+measured natural stops run 15K to beyond 48K — impossible inside a 104K window, trivial
+inside 252,928. The ASK-XHIGH lane uses output 131,072 with a **121,856-token prompt budget
+(still bigger than the entire old window)**. Daily Cline stays at medium/32,768.
+
+What keeps vLLM installed: **logprobs** (verifier / best-of-N tooling requires them; ninfer
+returns none), video-capable fallback, and ecosystem maturity. After cutover it boots
+on-demand for those jobs exactly the way ninfer used to boot for FAST.
+
+Reproduce any of it: `toolab.py`, `needleprobe.py`, `clinesim.py` (sequential + interleaved
+TTFT), `conc2big.py` (admission), `endure.py` (`CTX_SIZES` env), `cachehit-eval.py`,
+`vidprobe.py` + `genvid2.py` (large-font clip), `vision-probe.py`, `phase2.sh` /
+`phase2b.sh` / `phase2c.sh` / `phase2d.sh` (the exact batteries), `nfix_patch.py` +
+`nfix2_patch.py` (the parser fixes as applied). All honor `TARGET_URL`/`QWEN_URL`/`EVAL_URL`.
 
 ## Credits
 

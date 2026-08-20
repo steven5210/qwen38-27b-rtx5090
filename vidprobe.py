@@ -8,8 +8,8 @@ try: KEY=open(os.path.join(D,"api-key.txt")).read().strip()
 except Exception: KEY=""
 H={"Content-Type":"application/json"}
 if KEY: H["Authorization"]="Bearer "+KEY
-b64=open("/opt/ninfer/testvid.b64").read().strip()
-codes=[l.strip() for l in open("/opt/ninfer/testvid.codes") if l.strip()]
+b64=open(os.environ.get("VID_B64","/opt/ninfer/testvid.b64")).read().strip()
+codes=[l.strip() for l in open(os.environ.get("VID_CODES","/opt/ninfer/testvid.codes")) if l.strip()]
 print("clip: %d KB base64, %d planted codes"%(len(b64)//1024,len(codes)))
 body=dict(model=MODEL,max_tokens=1500,temperature=1.0,reasoning_effort="medium",
   messages=[{"role":"user","content":[
