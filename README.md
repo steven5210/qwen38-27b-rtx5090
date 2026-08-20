@@ -863,6 +863,11 @@ this on every attempt. We patched it on a fork branch (`fix/schema-typed-tool-ar
   new tests; a 6-shot live boolean probe returns properly typed
   `{"drain_first": true, "target_replicas": 7}` every time.
 
+- **Commit 3** — reuse telemetry: Chat Completions usage now carries
+  `prompt_tokens_details.cached_tokens`, fed by the same counter as the `cache=` log line and
+  mirroring ninfer's own Responses-API `input_tokens_details` field. Live-validated: an
+  identical repeat request reports `cached_tokens: 78` of 82 prompt tokens.
+
 Upstream: filed as [Neroued/ninfer#66](https://github.com/Neroued/ninfer/issues/66) with the
 repro table and fix design (issue-first per their CONTRIBUTING); PR offered from the branch.
 
@@ -941,7 +946,10 @@ On the vLLM fallback side, `--limit-mm-per-prompt`, `--mm-processor-kwargs max_p
 
 `START-NINFER.bat` boots the validated production profile in ~10 seconds (config in
 `ninfer-prod.conf`, monitor window auto-opens via `nmon.py` — READY state, VRAM alarms,
-reuse tallies, throughput). `STOP-NINFER.bat` is one click back to the vLLM stack.
+reuse tallies, throughput). `STOP-NINFER.bat` is one click back to the vLLM stack (via `stop-ninfer.sh`). The kit boots
+with `--host 0.0.0.0` (API-key gated): Tailscale lives *inside* WSL here, and ninfer's default
+is loopback-only — the one connectivity difference from vLLM's `--host 0.0.0.0` that bites
+remote clients.
 Cline settings against ninfer: OpenAI Compatible, base URL `http://127.0.0.1:8080/v1`,
 model `qwen3.8-27b`, context window **252,928**, max output **32,768** → **~220K usable
 prompt, 2.4x the vLLM setup's 90,112**. Full walk-through in `CLINE-NINFER.md`.
@@ -950,6 +958,34 @@ xhigh finally has room: the Qwen card's official reasoning budget is 262,144, an
 measured natural stops run 15K to beyond 48K — impossible inside a 104K window, trivial
 inside 252,928. The ASK-XHIGH lane uses output 131,072 with a **121,856-token prompt budget
 (still bigger than the entire old window)**. Daily Cline stays at medium/32,768.
+
+### Cline settings on ninfer — both profiles
+
+| | daily driver (medium) | full capability (xhigh) |
+|---|---|---|
+| Base URL | `http://127.0.0.1:8080/v1` (or the Tailscale IP) | same |
+| Model ID | `qwen3.8-27b` | same |
+| Context window | 252,928 | 252,928 |
+| Max output | 32,768 | **131,072** |
+| Reasoning effort | medium | xhigh |
+| Usable prompt | ~220K (2.4x the vLLM setup) | ~122K (still > the entire old window) |
+| Temperature | unset / 1.0 | unset / 1.0 — a client-forced 0 overrides the official thinking sampling (1.0 / top-p 0.95) and invites repetition loops on 100K-token thinks |
+
+### First live Cline session on ninfer (xhigh) — measured minutes in
+
+14 requests / ~523K prompt tokens into the first real session:
+
+- **Turn starts: 150–272 ms at ~50K context.** ninfer's completion log names the path
+  (`reuse=append_frontier`): each Cline turn extends the resident sequence — e.g.
+  `prompt=50,515 cache=50,321`, 99.6% of the prompt served from cache, ~194 tokens actually
+  prefilled. The same turn shape measured ~5s on the vLLM stack (the hybrid-SSM hit cost):
+  **~20x faster turn starts, live, not simulated.**
+- Reuse across the session: 12 of 14 requests, **454,593 tokens** served from cache.
+- Decode: **137.7 tok/s session average** under xhigh at ~50K context (battery numbers at
+  small context: 155–210 tok/s by mode). MTP acceptance on the latest request: 99/138 (72%),
+  per-position 37/33/29.
+- Per-request `usage.prompt_tokens_details.cached_tokens` (fix-branch commit 3) now reports
+  the same numbers on the wire, so any client can watch its own hit rate.
 
 What keeps vLLM installed: **logprobs** (verifier / best-of-N tooling requires them; ninfer
 returns none), video-capable fallback, and ecosystem maturity. After cutover it boots
