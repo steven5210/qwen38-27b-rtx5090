@@ -31,18 +31,23 @@ echo                      simple lookups and short code snippets.
 echo.
 echo   [5] CUSTOM         choose effort and token budget yourself
 echo.
+echo   [7] FAST ASK       medium, 8,192 tokens - uses or boots the light
+echo                      ninfer server (~15s) when the main one is down.
+echo.
 echo   [6] What do these actually cost?  (show the measured data)
 echo.
 echo   [Q] Quit
 echo.
 set "CHOICE="
-set /p "CHOICE=Select [1-6, Q]: "
+set /p "CHOICE=Select [1-7, Q]: "
 
 if /i "!CHOICE!"=="Q" exit /b 0
+set "FASTF="
 if "!CHOICE!"=="1" ( set "EFF=medium" & set "MAXT=16384" & goto ask )
 if "!CHOICE!"=="2" ( set "EFF=xhigh"  & set "MAXT=90000" & goto ask )
 if "!CHOICE!"=="3" ( set "EFF=low"    & set "MAXT=8192"  & goto ask )
 if "!CHOICE!"=="4" ( set "EFF=off"    & set "MAXT=8192"  & goto ask )
+if "!CHOICE!"=="7" ( set "EFF=medium" & set "MAXT=8192" & set "FASTF=--fast" & goto ask )
 if "!CHOICE!"=="5" goto custom
 if "!CHOICE!"=="6" goto data
 goto menu
@@ -119,9 +124,9 @@ if "!Q!"=="" ( echo. & echo   Nothing asked. & pause & goto menu )
 echo.
 echo ----------------------------------------------------------------
 if "!ATTACH!"=="" (
-  wsl -d Ubuntu-26.04 -u root --cd "%~dp0" -- /opt/qwen38/venv/bin/python ask-xhigh.py --effort !EFF! --max-tokens !MAXT! "!Q!"
+  wsl -d Ubuntu-26.04 -u root --cd "%~dp0" -- /opt/qwen38/venv/bin/python ask-xhigh.py !FASTF! --effort !EFF! --max-tokens !MAXT! "!Q!"
 ) else (
-  wsl -d Ubuntu-26.04 -u root --cd "%~dp0" -- /opt/qwen38/venv/bin/python ask-xhigh.py --effort !EFF! --max-tokens !MAXT! --file "!ATTACH!" "!Q!"
+  wsl -d Ubuntu-26.04 -u root --cd "%~dp0" -- /opt/qwen38/venv/bin/python ask-xhigh.py !FASTF! --effort !EFF! --max-tokens !MAXT! --file "!ATTACH!" "!Q!"
 )
 echo ----------------------------------------------------------------
 echo.

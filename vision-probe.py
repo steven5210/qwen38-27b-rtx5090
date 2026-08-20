@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Does the server actually SEE images, and what does an image cost in tokens/time?"""
 import base64, io, json, os, sys, time, urllib.request
-BASE="http://127.0.0.1:8000"; KEY=open(os.path.join(os.path.dirname(os.path.abspath(__file__)),"api-key.txt")).read().strip()
+BASE=os.environ.get("QWEN_URL","http://127.0.0.1:8000"); KEY=open(os.path.join(os.path.dirname(os.path.abspath(__file__)),"api-key.txt")).read().strip()
 def post(p,d,t=600):
     r=urllib.request.Request(BASE+p,data=json.dumps(d).encode(),
         headers={"Content-Type":"application/json","Authorization":"Bearer "+KEY})

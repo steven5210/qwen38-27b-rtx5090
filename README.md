@@ -47,6 +47,7 @@ explain why.
 | `ASK-MEDIUM.bat` / `ASK-XHIGH.bat` | the same thing without the menu, for scripting |
 | `START-VISION.bat` | screenshots / mockups |
 | `MONITOR.bat` | live dashboard: boot progress -> READY, KV/cache/acceptance, VRAM paging alarms (auto-opens with START-QWEN) |
+| `ASK-FAST.bat` / `STOP-FAST.bat` | one-off ask via the 10-second ninfer fast path when the main server is down |
 | `START-SHARED.bat` | two people, 60K context |
 
 **The three things that will bite you**
@@ -820,6 +821,49 @@ reach it from another machine, install Tailscale **inside WSL**
 (`curl -fsSL https://tailscale.com/install.sh | sh`, then `tailscale up --hostname=qwen-5090`)
 and use that node's tailnet IP — `serve-wsl.sh` keeps the daemon alive automatically. Bearer
 auth is always on. Nothing is exposed to the LAN or the internet.
+
+## The ninfer bake-off (same model, same card, a from-scratch C++ engine)
+
+[ninfer](https://github.com/Neroued/ninfer) is a 5090-exclusive C++/CUDA engine whose
+Qwen3.8-27B NVFP4 artifact is built from the same unsloth checkpoint this repo serves. We
+benchmarked it head-to-head with the identical eval suite. Measured here, WSL2, desktop loaded:
+
+| | ninfer (int8 KV, its published config) | This repo's vLLM stack |
+|---|---|---|
+| Boot to serving | **~10s** | ~2.5 min |
+| Short codegen | **186 tok/s** | 115.6 |
+| Long reasoning | **155 tok/s** | 65–89 |
+| Structured output | **210 tok/s** | ~115 |
+| 18K repeat turn | 0.28s | 2.4–3.6s |
+| Code accuracy (unit-tested) | **16/16** | 16/16–24/24 |
+| Long-context needles | **3/3 at 96K, 173K and 236K prompt tokens** | validated to ~90K window |
+| Image probe | 2/2 | 2/2 |
+| Tool calls, 20-call A/B | **12/20 — see the schema bug below** | **20/20** |
+
+The 236K needle run (106s wall, perfect retrieval, int8 KV) verifies the long-context claim
+on this card. Video input is mechanically functional (it decoded a 6-frame clip and correctly
+described its structure in 1.9s) but could not read small text after frame downscaling — a
+fair readability retest needs large-font content.
+
+**The one real defect — nested-JSON tool arguments.** In 20 tool calls across five content
+shapes, ninfer failed exactly the two JSON-file shapes (0/8) and passed everything else
+(12/12). Root cause, from its own wire responses: when a `write_file` argument declared as
+`type: string` contains JSON, ninfer returns it as a JSON **object** instead of a string —
+`"content": {...}` where the schema says `"content": "..."`. vLLM's parser always yields
+strings (20/20). Any client that trusts the declared schema — Cline writing a `.json` file —
+would break on this. Until fixed upstream, ninfer is not safe as the agent-loop server;
+`.py`/`.sh`/`.md` tool writes were flawless.
+
+**Where ninfer fits in this setup: the FAST path.** `ASK-FAST.bat` (or `QWEN-ASK.bat`
+option 7, or `ask-xhigh.py --fast`) answers one-off questions using whichever server is up —
+and when nothing is running, boots ninfer in ~15 seconds (32K context, int8 KV, MTP3, same
+API key) instead of waiting 2.5 minutes for the full stack. Thinking-off maps to ninfer's
+documented `reasoning_effort: "none"`. `STOP-FAST.bat` shuts it down; it never touches the
+main server. Both cannot run at once — the card fits one 27B resident at a time.
+
+Reproduce any of it: `toolab.py` (tool A/B), `needleprobe.py` (long-context, calibrated via
+the target's own token counter), `vidprobe.py` + `vision-probe.py` (media), all honoring
+`TARGET_URL`/`QWEN_URL` env overrides.
 
 ## Credits
 

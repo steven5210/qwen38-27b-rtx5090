@@ -22,7 +22,40 @@ def main():
     ap.add_argument("--effort", default="xhigh", choices=["xhigh","medium","low","off"])
     ap.add_argument("--max-tokens", type=int, default=90000)
     ap.add_argument("--temp", type=float, default=None, help="override sampling temperature")
+    ap.add_argument("--fast", action="store_true", help="use/boot the ninfer fast server (10-20s boot) when the main server is down")
     a=ap.parse_args()
+
+    global BASE
+    WINDOW = 106_000
+    if a.fast:
+        import subprocess
+        def _up(url):
+            try:
+                h={"Authorization":"Bearer "+KEY} if KEY else {}
+                urllib.request.urlopen(urllib.request.Request(url+"/v1/models",headers=h),timeout=3)
+                return True
+            except Exception: return False
+        if _up("http://127.0.0.1:8080"):
+            BASE="http://127.0.0.1:8080"; WINDOW=32_000
+            print("(fast server already up)")
+        elif _up("http://127.0.0.1:8000"):
+            print("(main server already running -- using it, nothing to boot)")
+        else:
+            print("booting fast server (ninfer, ~10-20s)...")
+            os.makedirs("/opt/ninfer/logs", exist_ok=True)
+            subprocess.Popen(["/opt/ninfer/src/build/apps/ninfer-serve",
+                "/opt/ninfer/models/qwen3_8_27b_nvfp4.ninfer",
+                "--max-context","32768","--kv-dtype","int8","--max-concurrency","2",
+                "--spec","mtp","--draft-tokens","3","--lm-head-draft","--api-key",KEY],
+                stdout=open("/opt/ninfer/logs/fast.out","ab"),
+                stderr=open("/opt/ninfer/logs/fast.err","ab"))
+            for _ in range(30):
+                time.sleep(2)
+                if _up("http://127.0.0.1:8080"): break
+            else:
+                print("!! fast server failed to start -- see /opt/ninfer/logs/fast.err"); sys.exit(1)
+            BASE="http://127.0.0.1:8080"; WINDOW=32_000
+            print("fast server READY (it stays up; stop with STOP-FAST.bat)")
 
     parts=[]
     for f in a.file:
@@ -46,7 +79,10 @@ def main():
         # thinking disabled entirely -- a separate mechanism from reasoning_effort.
         # Qwen3.8 model card recommends DIFFERENT sampling for non-thinking mode:
         # temperature=0.7, top_p=0.80, presence_penalty=1.5 (vs 1.0/0.95 for thinking).
-        body["chat_template_kwargs"] = {"enable_thinking": False}
+        if "8080" in BASE:
+            body["reasoning_effort"] = "none"      # ninfer's documented off-switch
+        else:
+            body["chat_template_kwargs"] = {"enable_thinking": False}
         body["temperature"] = a.temp if a.temp is not None else 0.7
         body["top_p"] = 0.80
         body["presence_penalty"] = 1.5
@@ -60,11 +96,11 @@ def main():
     # Pre-flight: the server enforces prompt + max_tokens <= 106,496 (measured exactly).
     # chars/3 over-estimates tokens for code, which errs on the safe side here.
     est_prompt = len(prompt) // 3 + 300
-    if est_prompt + a.max_tokens > 106_000:
-        new_max = 106_000 - est_prompt
+    if est_prompt + a.max_tokens > WINDOW:
+        new_max = WINDOW - est_prompt
         if new_max < 2_000:
             print("!! attachment too large: ~%d tokens estimated; even a minimal answer" % est_prompt)
-            print("!! budget will not fit the 106,496-token window. Trim the file and retry.")
+            print("!! budget will not fit this server's window. Trim the file and retry.")
             sys.exit(1)
         print("note: large prompt (~%d tokens est) -> lowering max_tokens %d -> %d to fit the window"
               % (est_prompt, a.max_tokens, new_max))
