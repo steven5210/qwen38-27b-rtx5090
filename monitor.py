@@ -124,7 +124,7 @@ def main():
             dq = curq - oldq
             return (100.0 * (cur - old) / dq) if dq > 0 else None
         hit60 = rate(ph, w[3], pq, w[2]) if w else None
-        acc60 = rate(acc, w[5], drf, w[4]) if w else None
+        acc60 = rate(acc, w[4], drf, w[5]) if w else None
         if tick % 3 == 1: vr_u, vr_t = vram()
 
         est = kvp * (pool or 0)
