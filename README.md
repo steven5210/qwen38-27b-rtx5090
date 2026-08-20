@@ -868,8 +868,15 @@ this on every attempt. We patched it on a fork branch (`fix/schema-typed-tool-ar
   mirroring ninfer's own Responses-API `input_tokens_details` field. Live-validated: an
   identical repeat request reports `cached_tokens: 78` of 82 prompt tokens.
 
+- **Commit 4** — residency: retention-aware lane selection + LRU retained eviction. Root cause
+  of "one resident conversation only" was admission tie-breaking (zero-reuse requests always
+  landed on lane 0, trampling its resident), not memory. +40/-10 policy-only change; see
+  `RESIDENCY-DESIGN.md` for the full trace and field survey.
+
 Upstream: filed as [Neroued/ninfer#66](https://github.com/Neroued/ninfer/issues/66) with the
 repro table and fix design (issue-first per their CONTRIBUTING); PR offered from the branch.
+The residency commit stays in our fork by choice for now — it changes scheduling behavior, and
+we'd rather run it ourselves first than presume upstream wants it.
 
 ### The full parity battery (Phase 2 — run at both windows)
 
@@ -949,7 +956,9 @@ On the vLLM fallback side, `--limit-mm-per-prompt`, `--mm-processor-kwargs max_p
 reuse tallies, throughput). `STOP-NINFER.bat` is one click back to the vLLM stack (via `stop-ninfer.sh`). The kit boots
 with `--host 0.0.0.0` (API-key gated): Tailscale lives *inside* WSL here, and ninfer's default
 is loopback-only — the one connectivity difference from vLLM's `--host 0.0.0.0` that bites
-remote clients.
+remote clients. `STOP-ALL.bat` stops *everything* — ninfer, vLLM, stray builds — and
+restarts nothing, printing an empty-port list + GPU memory as proof (the button you want when
+a heavy system job needs the whole machine).
 Cline settings against ninfer: OpenAI Compatible, base URL `http://127.0.0.1:8080/v1`,
 model `qwen3.8-27b`, context window **252,928**, max output **32,768** → **~220K usable
 prompt, 2.4x the vLLM setup's 90,112**. Full walk-through in `CLINE-NINFER.md`.
@@ -987,6 +996,28 @@ inside 252,928. The ASK-XHIGH lane uses output 131,072 with a **121,856-token pr
 - Per-request `usage.prompt_tokens_details.cached_tokens` (fix-branch commit 3) now reports
   the same numbers on the wire, so any client can watch its own hit rate.
 
+### Residency-N: two conversations resident at once (validated, adopted)
+
+The one real regression vs vLLM — "a FAST side-ask evicts your Cline session's cache" — is
+fixed in fix-branch commit 4. Tracing ~5K lines of the engine showed retention already exists
+per concurrency lane with best-reuse selection and page eviction; residency looked like 1 only
+because tie-breaking sent every fresh request to lane 0, destroying its resident. The fix makes
+selection retention-aware (most reuse -> unretained lanes -> LRU resident) and page reclaim
+LRU-first. **Resident conversations now = `--max-concurrency`.**
+
+Live validation on the patched binary (full battery, then production restored):
+
+| | before | after |
+|---|---|---|
+| Interleaved A/B late-turn TTFT | 7.5 s (full re-prefill every turn) | **3.18 s** |
+| Interleaved vs sequential @ 50K | 7.5 s vs 4.1 s | **3.42 s vs 3.45 s — identical** |
+| Parity battery | — | toolab 20/20, streamtool 3/3, multiturn 2/2, cache-hit 12/12 "NO REGRESSION" |
+
+JSONL forensics confirm both conversations reusing their full prior context from turn 2
+onward, alternating request-by-request. Design, alternatives considered (vLLM-style per-block
+state snapshots rejected — hybrid-GDN physics), and the validation plan live in
+`RESIDENCY-DESIGN.md`.
+
 What keeps vLLM installed: **logprobs** (verifier / best-of-N tooling requires them; ninfer
 returns none), video-capable fallback, and ecosystem maturity. After cutover it boots
 on-demand for those jobs exactly the way ninfer used to boot for FAST.
@@ -1015,7 +1046,7 @@ WSL — adjust both consistently if yours differ.
 
 ### Step by step
 
-**1. Clone and pin.** The three patches below are validated against upstream commit `feaf4dd`;
+**1. Clone and pin.** The four patches below are validated against upstream commit `feaf4dd`;
 newer master usually works, but the patchers are assert-guarded — on anchor drift they refuse
 loudly instead of mis-patching.
 
@@ -1032,6 +1063,7 @@ lands upstream — without them, string-declared tool arguments containing JSON 
     python3 $W/nfix_test.py      # its unit tests + docs note
     python3 $W/nfix2_patch.py    # vLLM-parity scalar coercion  -> NFIX2_PATCH_OK
     python3 $W/nfix3_patch.py    # cached_tokens usage telemetry -> NFIX3_PATCH_OK
+    python3 $W/nfix4_patch.py    # residency-N lane selection    -> NFIX4_PATCH_OK
 
 Each exits 0 and prints progress; rerunning prints "already patched" and changes nothing.
 An `AssertionError` means upstream drifted — stop and reconcile, never hand-edit around it.
@@ -1126,7 +1158,8 @@ xhigh session: 150–272 ms turn starts at ~50K context, ~138 tok/s decode.
     2. CLONE. git clone https://github.com/Neroued/ninfer.git /opt/ninfer/src, then
        cd /opt/ninfer/src && git checkout feaf4dd.
     3. PATCH. Run in order: python3 $W/nfix_patch.py ; python3 $W/nfix_test.py ;
-       python3 $W/nfix2_patch.py ; python3 $W/nfix3_patch.py. Gate: every one exits 0
+       python3 $W/nfix2_patch.py ; python3 $W/nfix3_patch.py ;
+       python3 $W/nfix4_patch.py. Gate: every one exits 0
        (progress lines, or "already patched"). An AssertionError -> STOP (upstream drift).
     4. BUILD. cmake -S /opt/ninfer/src -B /opt/ninfer/src/build -G Ninja
        -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON

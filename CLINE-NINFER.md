@@ -23,7 +23,8 @@ prefill 11x. Vision costs ~100K context on a 32 GB card.)
 
 Measured on the first live xhigh session: turn starts 150–272 ms at ~50K context
 (`reuse=append_frontier`, 99%+ of the prompt from cache), decode ~138 tok/s session average.
-Known behaviours: a FAST side-ask evicts the resident conversation -> one full re-prefill on the
-next turn (~10-13 s at 90K, then fast again); two 130K+ conversations at once -> the second gets
+Known behaviours: Cline and a FAST side-ask each keep their own resident conversation
+(residency = max-concurrency since fix-branch commit 4; interleaved turn starts validated at
+sequential speed); two 130K+ conversations at once -> the second gets
 HTTP 503 until the first drains (fail-fast admission, just retry); keep one reasoning effort per
 task (changing it busts prefix reuse on any stack).
