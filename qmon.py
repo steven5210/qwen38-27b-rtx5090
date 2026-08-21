@@ -82,7 +82,10 @@ def spark(vals, w):
 
 def fmt_tok(n): return format(int(n), ",")
 
-RE_DONE = re.compile(r"\[req (\d+)\] done finish=(\S+).*?prompt=(\d+) gen=(\d+) cache=(\d+) reuse=(\S+) ttft=(\d+)ms")
+RE_DONE = re.compile(
+    r"\[req (\d+)\] done finish=(\S+)(?: tool_calls=(\d+))? prompt=(\d+) gen=(\d+) cache=(\d+) "
+    r"reuse=(\S+) ttft=(\d+)ms(?: prefill=([\d.]+)tok/s)?(?: decode=([\d.]+)tok/s)?"
+    r"(?: wall=([\d.]+)s)?(?: speculative=\S+ ([\d.]+)tok/round \(([\d.]+)%\))?")
 RE_THR  = re.compile(r"throughput interval=[\d.]+s prefill=([\d.]+)tok/s decode=([\d.]+)tok/s running=(\d+) prefilling=(\d+) decode_ready=(\d+) waiting=(\d+)")
 
 class Screen:
@@ -167,7 +170,7 @@ def main():
                 L.append(col("  START-NINFER.bat (10s) or START-QWEN38.bat (~2.5min) to boot", "d"))
             elif stack == "ninfer":
                 ctx = conf_ctx() or 252928
-                txt = tail_file(ERR, 500_000)
+                txt = tail_file(ERR, 2_000_000)
                 reqs = [RE_DONE.search(l) for l in txt.splitlines() if "] done " in l]
                 reqs = [m for m in reqs if m]
                 thr  = [RE_THR.search(l) for l in txt.splitlines() if "throughput" in l]
@@ -182,8 +185,8 @@ def main():
                 L.append(H)
                 if reqs:
                     m_ = reqs[-1]
-                    p_, g_, c_ = int(m_.group(3)), int(m_.group(4)), int(m_.group(5))
-                    path, ttft = m_.group(6), int(m_.group(7)) / 1000.0
+                    p_, g_, c_ = int(m_.group(4)), int(m_.group(5)), int(m_.group(6))
+                    path, ttft = m_.group(7), int(m_.group(8)) / 1000.0
                     pct = p_ / ctx
                     L.append("  context   [%s] %s / %s  %d%%" %
                              (bar(pct, width - 42), fmt_tok(p_), fmt_tok(ctx), round(100 * pct)))
@@ -192,14 +195,41 @@ def main():
                              col(path.replace("restore_", "restore ") + " ↻", "c"))
                     L.append(col("  last req  ", "d") + "prompt %s   cached %s (%d%%)   %s   ttft %.2fs" %
                              (fmt_tok(p_), fmt_tok(c_), round(100.0 * c_ / p_) if p_ else 0, glyph, ttft))
-                    cac = [int(m.group(5)) for m in reqs]
-                    hits = [c for c in cac if c > 0]
-                    L.append("  requests  running %d  waiting %d      session %d reqs, %d%% reused, %s tok from cache" %
-                             (run, wai, len(reqs), round(100.0 * len(hits) / len(cac)), fmt_tok(sum(hits))))
+                    # ---- session aggregates from the completion lines ----
+                    P = [int(m.group(4)) for m in reqs]; G = [int(m.group(5)) for m in reqs]
+                    CC = [int(m.group(6)) for m in reqs]; T = [int(m.group(8)) for m in reqs]
+                    DEC = [(g, float(m.group(10))) for g, m in zip(G, reqs) if m.group(10)]
+                    WALL = [float(m.group(11)) for m in reqs if m.group(11)]
+                    ACC = [(g, float(m.group(13))) for g, m in zip(G, reqs) if m.group(13)]
+                    def wavg(pairs):
+                        tt = sum(g / r for g, r in pairs if r > 0); gg = sum(g for g, r in pairs)
+                        return gg / tt if tt > 0 else 0.0
+                    avg_dec = wavg(DEC); last10_dec = wavg(DEC[-10:])
+                    fin = {}
+                    for m in reqs: fin[m.group(2)] = fin.get(m.group(2), 0) + 1
+                    fintxt = " · ".join("%s %d" % (k.replace("tool_calls", "tool"), v) for k, v in sorted(fin.items()))
+                    ntr = fin.get("length", 0) + fin.get("output_limit", 0)
+                    if ntr: fintxt = col(fintxt + "  << %d truncated (raise max output?)" % ntr, "y")
+                    hits = [c for c in CC if c > 0]
+                    busy = min(1.0, sum(WALL) / max(1.0, up_secs or 1)) if WALL else 0.0
+                    L.append("  requests  running %d  waiting %d      finish: %s" % (run, wai, fintxt))
+                    L.append("  decode    %7.1f tok/s now  %s" % (dec, col(spark(dec_hist, width - 58), "c")) +
+                             col("  avg %5.1f · last-10 %5.1f" % (avg_dec, last10_dec), "d"))
+                    L.append("  prefill   %7.1f tok/s now   last req %s tok/s" %
+                             (pre, m_.group(9) or "--"))
+                    if ACC:
+                        sess_acc = sum(g * a2 for g, a2 in ACC) / max(1, sum(g for g, _ in ACC))
+                        L.append("  mtp       %s%% accept last (%s tok/round)   session %.1f%%" %
+                                 (m_.group(13) or "--", m_.group(12) or "-", sess_acc))
+                    L.append("  ttft      last %.2fs · last-10 avg %.2fs · session avg %.2fs" %
+                             (ttft, sum(T[-10:]) / len(T[-10:]) / 1000.0, sum(T) / len(T) / 1000.0))
+                    L.append("  session   %d reqs · out %s · prompt %s (%s%% served from cache) · busy %d%%" %
+                             (len(reqs), fmt_tok(sum(G)), fmt_tok(sum(P)),
+                              round(100.0 * sum(CC) / sum(P)) if sum(P) else 0, round(100 * busy)))
                 else:
                     L.append("  requests  running %d  waiting %d      (no completions logged yet)" % (run, wai))
-                L.append("  decode    %7.1f tok/s  %s" % (dec, col(spark(dec_hist, width - 40), "c")))
-                L.append("  prefill   %7.1f tok/s" % pre)
+                    L.append("  decode    %7.1f tok/s  %s" % (dec, col(spark(dec_hist, width - 40), "c")))
+                    L.append("  prefill   %7.1f tok/s" % pre)
             else:  # vllm
                 try:
                     mtx = {}
@@ -268,9 +298,10 @@ def main():
                     L.append(H)
                     L.append(col("  recent", "d"))
                     for m_ in txt2[-4:][::-1]:
-                        L.append(col("    #%-4s %9sp %9sc  %-22s %5.2fs ttft" %
-                                 (m_.group(1), fmt_tok(m_.group(3)), fmt_tok(m_.group(5)),
-                                  m_.group(6), int(m_.group(7)) / 1000.0), "d"))
+                        L.append(col("    #%-4s %9sp %9sc  %-16s %5.2fs ttft  %6s tok/s  %s%%mtp" %
+                                 (m_.group(1), fmt_tok(m_.group(4)), fmt_tok(m_.group(6)),
+                                  m_.group(7)[:16], int(m_.group(8)) / 1000.0,
+                                  m_.group(10) or "--", m_.group(13) or "--"), "d"))
             L.append(H)
             L.append(col("  Ctrl+C or close window to quit -- servers unaffected", "d"))
             scr.draw(L)
