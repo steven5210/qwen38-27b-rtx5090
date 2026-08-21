@@ -517,6 +517,12 @@ section and `RESIDENCY-DESIGN.md`.
 
 #### Vision & video head-to-head (and the config ceiling)
 
+> Probe-flake postmortem (2026-08-21): occasional vision-probe 0/2 scores were traced to the
+> probe itself leaving `reasoning_effort` unset — default thinking at temp 1.0 sometimes
+> overran the probe's 900-token cap (`finish=length`, empty answer; reproduced 2/6). Vision +
+> prefix reuse + media cache were each cleared explicitly (10/10 correct across fresh,
+> repeated, re-questioned, and swapped images). The probe now pins `reasoning_effort: none`.
+
 With a large-font test clip (the honest retest of the earlier artifact):
 
 | | image (stack-trace screenshot) | video (6 planted codes) | vision boot cost |

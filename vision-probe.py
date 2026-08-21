@@ -27,7 +27,10 @@ CODE=["Traceback (most recent call last):",
 def main():
     b64=make_png(CODE)
     t0=time.time()
-    r=post("/v1/chat/completions", dict(model="qwen3.8-27b", temperature=1.0, max_tokens=900,
+    # reasoning_effort pinned: this probe measures VISION, not reasoning. Left unset, the
+    # template defaults to thinking at temp 1.0, and thinking-length variance vs the 900-token
+    # cap made the probe flake ~2/6 (finish=length, empty content) -- measured 2026-08-21.
+    r=post("/v1/chat/completions", dict(model="qwen3.8-27b", reasoning_effort="none", max_tokens=900,
         messages=[{"role":"user","content":[
             {"type":"image_url","image_url":{"url":"data:image/png;base64,"+b64}},
             {"type":"text","text":"This is a screenshot of an error. Answer with exactly two lines:\n"
