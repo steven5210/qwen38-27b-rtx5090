@@ -21,7 +21,7 @@ work to the ninfer server on this machine. Validated end-to-end on 2026-08-20.
 
 3. Fully quit Claude Desktop (system tray -> Quit) and reopen it.
 4. Check: the tools icon in a new chat should list qwen_health / qwen_ask / qwen_submit /
-   qwen_status / qwen_result. Say "run qwen_health" -- expect UP + window 252,928.
+   qwen_status / qwen_result. Say "run qwen_health" -- expect UP + window 262,144.
 
 Why wsl.exe: the server runs inside WSL where 127.0.0.1:8080 is guaranteed reachable
 (same path every probe in this repo used). No Windows Python, no pip installs.
@@ -57,7 +57,7 @@ Same server, same jobs, from the couch. Latency adds only the tailnet round-trip
    preferences/project. It makes Claude JUDGE each task instead of pattern-matching a
    task list, with quality always ahead of token savings:
 
-   > I have a local Qwen3.8-27B (252,928-token context, reasoning_effort xhigh) available
+   > I have a local Qwen3.8-27B (262,144-token context, reasoning_effort xhigh) available
    > through the qwen-local MCP tools. YOU (Fable) ARE THE ORCHESTRATOR; QWEN IS YOUR
    > DELEGATE. For any task or subtask, you decide whether to delegate: judge whether a
    > strong 27B with a huge context window can do it at FULL quality -- bounded, precisely

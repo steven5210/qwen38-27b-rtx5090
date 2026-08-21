@@ -11,20 +11,20 @@ Cline -> API Provider: **OpenAI Compatible**
 
 | | medium (daily driver) | xhigh (full capability) |
 |---|---|---|
-| Context window | 252,928 | 252,928 |
+| Context window | 262,144 | 262,144 |
 | Max output | 32,768 | **131,072** |
 | Reasoning effort | medium | xhigh |
-| Usable prompt | ~220K | ~122K |
+| Usable prompt | ~229K | exactly 131,072 |
 | Temperature | unset / 1.0 | unset / 1.0 (never 0 — overrides official thinking sampling, loops on long thinks) |
 
-Vision day: flip `ninfer-prod.conf` to Option A (`CTX=152576`, `VISION=1`) and set the Cline
-context window to 152,576. (192K+vision boots but is a validated trap: ~0.5 GB free starves
-prefill 11x. Vision costs ~100K context on a 32 GB card.)
+Vision day: flip `ninfer-prod.conf` to Option A (`CTX=172032`, `VISION=1`) and set the Cline
+context window to 172,032. (192K+vision remains a validated trap -- workspace starvation, 7-11x
+slow prefill. 172,032 measured at full text-par speed.) PREREQUISITE for both profiles:
+Wallpaper Engine never runs alongside the server; WE-tolerant fallbacks are 252,928 / 152,576.
 
 Measured on the first live xhigh session: turn starts 150–272 ms at ~50K context
 (`reuse=append_frontier`, 99%+ of the prompt from cache), decode ~138 tok/s session average.
-Known behaviours: Cline and a FAST side-ask each keep their own resident conversation
-(residency = max-concurrency since fix-branch commit 4; interleaved turn starts validated at
-sequential speed); two 130K+ conversations at once -> the second gets
+Known behaviours: a FAST side-ask evicts the resident conversation -> one full re-prefill on the
+next turn (~10-13 s at 90K, then fast again); two 130K+ conversations at once -> the second gets
 HTTP 503 until the first drains (fail-fast admission, just retry); keep one reasoning effort per
 task (changing it busts prefix reuse on any stack).

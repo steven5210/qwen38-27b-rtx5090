@@ -64,13 +64,14 @@ If you read nothing else, read this. Every value is measured; the linked section
 |---|---|---|
 | Base URL | `http://127.0.0.1:8080/v1` (remote: your Tailscale IP) | same |
 | Model / API key | `qwen3.8-27b` / from `api-key.txt` | same |
-| **Context Window Size** | **252,928** (vision profile: 152,576) | 252,928 |
+| **Context Window Size** | **262,144** (vision profile: 172,032) | 262,144 |
 | **Max Output Tokens** | **32,768** | **131,072** |
 | **Reasoning Effort** | **medium** | xhigh |
 | **Temperature** | **1.0, set explicitly** — clients that send 0 make thinking models loop | same |
 
-Server profiles live in `ninfer-prod.conf`: Option B text-max `CTX=252928 VISION=0` (default)
-or Option A vision `CTX=152576 VISION=1`. vLLM fallback client settings (`:8000`, window
+Server profiles live in `ninfer-prod.conf`: Option B text-max `CTX=262144 VISION=0` (default,
+the model's native max) or Option A vision `CTX=172032 VISION=1` — both require Wallpaper
+Engine off (WE-tolerant fallbacks: 252,928 / 152,576). vLLM fallback client settings (`:8000`, window
 96,000, output 16,384): see [Client settings](#client-settings-cline--roo--continue--any-openai-client).
 
 **Commands**
@@ -132,10 +133,10 @@ inside 252,928. The ASK-XHIGH lane uses output 131,072 with a **121,856-token pr
 |---|---|---|
 | Base URL | `http://127.0.0.1:8080/v1` (or the Tailscale IP) | same |
 | Model ID | `qwen3.8-27b` | same |
-| Context window | 252,928 | 252,928 |
+| Context window | 262,144 | 262,144 |
 | Max output | 32,768 | **131,072** |
 | Reasoning effort | medium | xhigh |
-| Usable prompt | ~220K (2.4x the vLLM setup) | ~122K (still > the entire old window) |
+| Usable prompt | ~229K (2.5x the vLLM setup) | exactly 131,072 (still > the entire old window) |
 | Temperature | unset / 1.0 | unset / 1.0 — a client-forced 0 overrides the official thinking sampling (1.0 / top-p 0.95) and invites repetition loops on 100K-token thinks |
 
 ### Remote access (optional)
@@ -203,22 +204,28 @@ TTFT), `conc2big.py` (admission), `endure.py` (`CTX_SIZES` env), `cachehit-eval.
 `phase2b.sh` / `phase2c.sh` / `phase2d.sh` (the exact batteries), `nfix_patch.py` +
 `nfix2_patch.py` (the parser fixes as applied). All honor `TARGET_URL`/`QWEN_URL`/`EVAL_URL`.
 
-### Why not 262,144, and why concurrency 2 stays (measured)
+### The context ceilings, measured — and the Wallpaper Engine plot twist
 
-Two tempting "free wins," both tested 2026-08-21 and both refuted:
+Three rounds of testing on 2026-08-21, with a mid-experiment discovery that overturned the
+first verdict:
 
-- **The model's native max (262,144) boots — and collapses.** At conc 2 the pool resolves
-  (`resolved=262144`, 494 MiB free) but decode drops to **20.7 tok/s** (vs 155–210) and
-  prefill to **450 tok/s** (vs ~6,500), with CUDA graphs failing to capture — the <0.5 GB
-  free-VRAM paging cliff this machine's gotchas already documented, now measured on ninfer.
-  252,928 is the *performance* ceiling of a 32 GB card, not a compromise: the last 9,216
-  addressable tokens cost ~10x your speed.
-- **Dropping `--max-concurrency` to 1 does not raise context.** The KV pool is shared, not
-  split per lane — a single request can hold ~the whole pool (the 236K needle passed at
-  conc 2). Lane 2 costs megabytes of workspace and buys residency-2 (Cline + side-asks both
-  hot) and Cline-parallel MCP delegation. Vision at 192,512 on conc 1 boots into the same
-  starvation zone (561 MiB free) — the 11x vision trap is a free-VRAM property, not a
-  concurrency one; vision stays 152,576.
+- **Concurrency 2 does not cost context.** The KV pool is shared, not split per lane — a
+  single request can hold ~the whole pool (the 236K needle passed at conc 2). Lane 2 costs
+  megabytes of workspace and buys residency-2 plus Cline-parallel MCP delegation. Refuted
+  for good.
+- **262,144 (the model's native max) first measured as a collapse — decode 20.7 tok/s —
+  then fully exonerated.** The killer was Wallpaper Engine *actively compositing*: with
+  `wallpaper64.exe` terminated (even with ~1.5 GB of other desktop apps still resident),
+  the same config runs the 250K needle at **prefill 2,238 tok/s, decode 142 tok/s at 240K
+  context, MTP 84%, 3/3 found** — indistinguishable from 252,928. Adopted as the production
+  default, with WE disabled from startup as the standing prerequisite and 252,928 kept as
+  the WE-tolerant fallback (it survived a full live session with WE running; 262,144 does
+  not).
+- **The vision ceiling moved up, but 192,512 stays banned.** The 192,512+vision trap is
+  real and WE-independent (workspace starvation: 819 tok/s prefill even on a clean desktop).
+  Probing the gap found the boundary: **vision at 172,032 runs at full text-par speed**
+  (5,945 tok/s @ 40K prefill, decode 170.8, images 2/2) — adopted as the vision profile,
+  +19,456 tokens over the old 152,576 (which remains the WE-tolerant fallback).
 
 ## Part II — Setting up ninfer from scratch (humans and AI agents)
 
@@ -282,9 +289,13 @@ vLLM venv). The SHA-256 is non-negotiable — on mismatch, delete and re-downloa
 
 **6. Pick a profile** in `ninfer-prod.conf` — these are measured optima, not suggestions:
 
-    CTX=252928  VISION=0   # Option B (default): max text. 9s boot, ~1.0 GB free, 57s @ 173K prefill
-    CTX=152576  VISION=1   # Option A: image+video input. 10s boot, ~2.2 GB free, 41s @ 135K prefill
-    # never VISION=1 with CTX>152576: 192,512 boots but leaves ~0.5 GB free -> 11x slower prefill
+    CTX=262144  VISION=0   # Option B (default): the model's native max. Validated WE-free:
+                           #   needle 3/3 @ 240K, prefill 2,238 tok/s, decode 142 tok/s @ 240K ctx
+    CTX=172032  VISION=1   # Option A: image+video input. Validated WE-free: 5,945 tok/s @ 40K
+                           #   prefill (full text par), decode 170.8, images 2/2
+    # PREREQUISITE: Wallpaper Engine off (its live compositing collapses decode 5-10x).
+    # WE-tolerant fallbacks: CTX=252928 VISION=0 | CTX=152576 VISION=1
+    # never VISION=1 at 192512+: workspace starvation, 7-11x slower prefill (WE-independent)
 
 **7. Boot + verification ladder.** `START-NINFER.bat` (server + NMON monitor; READY in ~10 s).
 The kit boots with `--host 0.0.0.0` (API-key gated) so Tailscale/LAN clients work — stock
@@ -318,10 +329,10 @@ OpenAI Compatible · Base URL `http://127.0.0.1:8080/v1` (Tailscale: `http://100
 
 | | medium — daily driver | xhigh — full capability | vision day (conf Option A) |
 |---|---|---|---|
-| Context window | 252,928 | 252,928 | **152,576** |
+| Context window | 262,144 | 262,144 | **172,032** |
 | Max output | 32,768 | **131,072** | 32,768 (49,152 if you want xhigh+vision) |
 | Reasoning effort | medium | xhigh | medium |
-| Usable prompt | ~220K | ~122K | ~120K |
+| Usable prompt | ~229K | 131,072 | ~139K |
 | Temperature | unset / 1.0 | unset / 1.0 — **never 0**: it overrides the official thinking sampling (1.0 / top-p 0.95) and invites repetition loops on 100K-token thinks | unset / 1.0 |
 
 Keep one effort per task (changing it busts prefix reuse — the instruction lives at the prompt
