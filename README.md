@@ -111,7 +111,10 @@ Boot it, point Cline at it, done.
 reuse tallies, throughput). `STOP-NINFER.bat` is one click back to the vLLM stack (via `stop-ninfer.sh`). The kit boots
 with `--host 0.0.0.0` (API-key gated): Tailscale lives *inside* WSL here, and ninfer's default
 is loopback-only — the one connectivity difference from vLLM's `--host 0.0.0.0` that bites
-remote clients. `STOP-ALL.bat` stops *everything* — ninfer, vLLM, stray builds — and
+remote clients. **QMON** is the unified live monitor (`QMON.bat`; NMON.bat / MONITOR.bat are aliases):
+flicker-free alt-screen rendering, follows whichever stack is up, context bar + reuse path +
+TTFT per request, decode sparkline, real process uptime, and VRAM alarms (measured paging
+thresholds on vLLM; growth-above-boot-baseline on ninfer). `STOP-ALL.bat` stops *everything* — ninfer, vLLM, stray builds — and
 restarts nothing, printing an empty-port list + GPU memory as proof (the button you want when
 a heavy system job needs the whole machine).
 Cline settings against ninfer: OpenAI Compatible, base URL `http://127.0.0.1:8080/v1`,
@@ -158,6 +161,15 @@ auth is always on. Nothing is exposed to the LAN or the internet.
   per-position 37/33/29.
 - Per-request `usage.prompt_tokens_details.cached_tokens` (fix-branch commit 3) now reports
   the same numbers on the wire, so any client can watch its own hit rate.
+
+### Delegating Claude work to local Qwen (MCP)
+
+`qwen_mcp.py` + `QWEN-MCP-SETUP.md`: a zero-dependency local MCP server (launched by Claude
+Desktop via wsl.exe) that lets Claude orchestrate and delegate bounded tasks to this machine's
+Qwen at xhigh -- submit/poll design so MCP client timeouts can never fire, size pre-checks,
+cached_tokens usage reporting, and a fast sync lane for quick questions. Validated end-to-end
+(handshake, live ask, background job lifecycle). Setup and the delegation playbook are in
+[QWEN-MCP-SETUP.md](QWEN-MCP-SETUP.md).
 
 ### Residency-N: two conversations resident at once (validated, adopted)
 
