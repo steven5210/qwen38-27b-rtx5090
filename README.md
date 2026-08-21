@@ -203,6 +203,23 @@ TTFT), `conc2big.py` (admission), `endure.py` (`CTX_SIZES` env), `cachehit-eval.
 `phase2b.sh` / `phase2c.sh` / `phase2d.sh` (the exact batteries), `nfix_patch.py` +
 `nfix2_patch.py` (the parser fixes as applied). All honor `TARGET_URL`/`QWEN_URL`/`EVAL_URL`.
 
+### Why not 262,144, and why concurrency 2 stays (measured)
+
+Two tempting "free wins," both tested 2026-08-21 and both refuted:
+
+- **The model's native max (262,144) boots — and collapses.** At conc 2 the pool resolves
+  (`resolved=262144`, 494 MiB free) but decode drops to **20.7 tok/s** (vs 155–210) and
+  prefill to **450 tok/s** (vs ~6,500), with CUDA graphs failing to capture — the <0.5 GB
+  free-VRAM paging cliff this machine's gotchas already documented, now measured on ninfer.
+  252,928 is the *performance* ceiling of a 32 GB card, not a compromise: the last 9,216
+  addressable tokens cost ~10x your speed.
+- **Dropping `--max-concurrency` to 1 does not raise context.** The KV pool is shared, not
+  split per lane — a single request can hold ~the whole pool (the 236K needle passed at
+  conc 2). Lane 2 costs megabytes of workspace and buys residency-2 (Cline + side-asks both
+  hot) and Cline-parallel MCP delegation. Vision at 192,512 on conc 1 boots into the same
+  starvation zone (561 MiB free) — the 11x vision trap is a free-VRAM property, not a
+  concurrency one; vision stays 152,576.
+
 ## Part II — Setting up ninfer from scratch (humans and AI agents)
 
 Everything in this section was executed and verified on this machine — commands are literal,
