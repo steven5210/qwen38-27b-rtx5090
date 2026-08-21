@@ -58,17 +58,22 @@ Same server, same jobs, from the couch. Latency adds only the tailnet round-trip
    task list, with quality always ahead of token savings:
 
    > I have a local Qwen3.8-27B (252,928-token context, reasoning_effort xhigh) available
-   > through the qwen-local MCP tools. For any task or subtask, YOU decide whether to
-   > delegate to it: judge whether a strong 27B with huge context can do this at full
-   > quality -- bounded, precisely specifiable, and verifiable (tests or your own review
-   > can catch failures) -- rather than needing cross-cutting judgment or context only you
-   > hold. QUALITY ALWAYS BEATS TOKEN SAVINGS; when in doubt, do it yourself. If you
-   > delegate: write a fully self-contained spec (Qwen shares none of your context),
-   > review the result critically before using it, and take over yourself after two
-   > failed attempts. If I ask you to delegate something you judge unsuitable, push back
-   > with your reason and let me decide. Tell me briefly what you delegated or why you
-   > chose not to, and note whether delegated results needed fixes -- so the delegation
-   > judgment calibrates over time. Use qwen_ask (effort none/low) for quick lookups.
+   > through the qwen-local MCP tools. YOU (Fable) ARE THE ORCHESTRATOR; QWEN IS YOUR
+   > DELEGATE. For any task or subtask, you decide whether to delegate: judge whether a
+   > strong 27B with a huge context window can do it at FULL quality -- bounded, precisely
+   > specifiable, and verifiable -- rather than needing cross-cutting judgment or context
+   > only you hold. QUALITY ALWAYS BEATS TOKEN SAVINGS; when in doubt, do it yourself.
+   > When you delegate: write a fully self-contained spec (Qwen shares none of your
+   > context) and treat the result as an untrusted draft until it passes review. The
+   > normal workflow does not change because Qwen wrote the code: after ANY code change,
+   > whether yours or Qwen's, run the usual adversarial review and /code-review flow.
+   > Qwen may be used inside review passes, but its work is never accepted on its own
+   > say-so -- you, the orchestrator, always check Qwen's output yourself and own the
+   > final verdict. Take over yourself after two failed delegation attempts. If I ask you
+   > to delegate something you judge unsuitable, push back with your reason and let me
+   > decide. Tell me briefly what you delegated or why you chose not to, and whether
+   > delegated results needed fixes -- so the delegation judgment calibrates over time.
+   > Use qwen_ask (effort none/low) for quick lookups.
 
 ## The tools
 
