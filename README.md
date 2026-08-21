@@ -4,7 +4,8 @@ Runs **Qwen3.8-27B (unsloth NVFP4)** two ways on a desktop RTX 5090 (SM120, 32GB
 every number in this repo measured on this machine, nothing assumed:
 
 - **Production: [ninfer](https://github.com/Neroued/ninfer)** — a from-scratch C++/CUDA engine
-  running our four-commit fix branch. **252,928-token context** (2.4x the vLLM setup), ~10 s
+  running our four-commit fix branch. **262,144-token context** (the model's native max,
+  2.5x the vLLM setup), ~10 s
   boots, live Cline turn starts of **150–565 ms** at 50–100K context, two conversations
   resident at once. Parts I–III.
 - **Fallback: vLLM 0.27.1** — the original stack this repo was built on, still one click away
@@ -93,8 +94,8 @@ Engine off (WE-tolerant fallbacks: 252,928 / 152,576). vLLM fallback client sett
    Wallpaper Engine. (Both stacks.)
 2. **Reasoning effort left unset** → the chat template defaults to `xhigh`, which scored
    **9/24 vs medium's 24/24** for agent coding here. [Details](#do-not-use-reasoning_effort-xhigh-for-agent-coding). (Both stacks.)
-3. **`VISION=1` with `CTX` above 152,576 on ninfer** → boots fine, then prefill runs 11x
-   slower with flaky image answers. Use the profile pair as written.
+3. **`VISION=1` with `CTX` at 192,512+ on ninfer** → boots fine, then prefill runs 7-11x
+   slower. The measured vision ceiling is **172,032**; use the profile pair as written.
 4. **Raising `--max-num-batched-tokens` on vLLM** → looks like a prefill optimization,
    silently makes the server 27x slower after ten minutes.
 
@@ -119,12 +120,12 @@ thresholds on vLLM; growth-above-boot-baseline on ninfer). `STOP-ALL.bat` stops 
 restarts nothing, printing an empty-port list + GPU memory as proof (the button you want when
 a heavy system job needs the whole machine).
 Cline settings against ninfer: OpenAI Compatible, base URL `http://127.0.0.1:8080/v1`,
-model `qwen3.8-27b`, context window **252,928**, max output **32,768** → **~220K usable
-prompt, 2.4x the vLLM setup's 90,112**. Full walk-through in `CLINE-NINFER.md`.
+model `qwen3.8-27b`, context window **262,144**, max output **32,768** → **229,376 usable
+prompt, 2.5x the vLLM setup's 90,112**. Full walk-through in `CLINE-NINFER.md`.
 
 xhigh finally has room: the Qwen card's official reasoning budget is 262,144, and our
 measured natural stops run 15K to beyond 48K — impossible inside a 104K window, trivial
-inside 252,928. The ASK-XHIGH lane uses output 131,072 with a **121,856-token prompt budget
+inside 262,144. The xhigh lane uses output 131,072 with a prompt budget of **exactly 131,072
 (still bigger than the entire old window)**. Daily Cline stays at medium/32,768.
 
 ### Cline settings on ninfer — both profiles
@@ -385,8 +386,9 @@ xhigh session: 150–272 ms turn starts at ~50K context, ~138 tok/s decode.
        mismatch: delete the file and STOP.
     6. KEY. Ensure $W/api-key.txt exists: exactly one line, no trailing whitespace.
        Do not display its contents.
-    7. PROFILE. Ensure $W/ninfer-prod.conf contains CTX=252928 and VISION=0 (text
-       default), or CTX=152576 VISION=1 for vision. Never VISION=1 with CTX above 152576.
+    7. PROFILE. Ensure $W/ninfer-prod.conf contains CTX=262144 and VISION=0 (text
+       default), or CTX=172032 VISION=1 for vision. Both REQUIRE Wallpaper Engine not
+       running (WE-tolerant fallbacks: 252928 / 152576). Never VISION=1 at CTX 192512+.
     8. BOOT. Interactive: the user double-clicks START-NINFER.bat. Headless:
        nohup bash $W/ninfer-serve-prod.sh >/dev/null 2>&1 &. Gate: within 60 s,
        curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(cat $W/api-key.txt)"
