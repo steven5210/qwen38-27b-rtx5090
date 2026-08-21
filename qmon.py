@@ -63,6 +63,19 @@ def tail_file(path, nbytes):
             return f.read().decode("utf-8", "replace")
     except Exception: return ""
 
+def head_file(path, nbytes):
+    try:
+        with open(path, "rb") as f:
+            return f.read(nbytes).decode("utf-8", "replace")
+    except Exception: return ""
+
+def server_profile():
+    """Authoritative window + vision flag from the running server's own boot line
+    (prod.err is truncated at each boot, so the capacity line lives in the head)."""
+    h = head_file(ERR, 8000)
+    m = re.search(r"KV capacity \S+ resolved=(\d+) tokens", h)
+    return (int(m.group(1)) if m else None), ("media-workers=" in h)
+
 def conf_ctx():
     try:
         t = open(os.path.join(D, "ninfer-prod.conf")).read()
@@ -169,7 +182,8 @@ def main():
                 L.append(H)
                 L.append(col("  START-NINFER.bat (10s) or START-QWEN38.bat (~2.5min) to boot", "d"))
             elif stack == "ninfer":
-                ctx = conf_ctx() or 252928
+                srv_ctx, srv_vision = server_profile()
+                ctx = srv_ctx or conf_ctx() or 252928
                 txt = tail_file(ERR, 2_000_000)
                 reqs = [RE_DONE.search(l) for l in txt.splitlines() if "] done " in l]
                 reqs = [m for m in reqs if m]
@@ -181,7 +195,9 @@ def main():
                     run, wai = int(t_.group(3)), int(t_.group(6))
                 dec_hist.append(dec); dec_hist[:] = dec_hist[-60:]
                 L.append("  " + col("READY", "g") + "  %s  " % model +
-                         col("ninfer :8080  up %s" % fmt_up(up_secs), "d"))
+                         (col("VISION", "c") + "  " if srv_vision else "") +
+                         col("ninfer :8080  window %s (server-reported)  up %s" %
+                             (fmt_tok(ctx), fmt_up(up_secs)), "d"))
                 L.append(H)
                 if reqs:
                     m_ = reqs[-1]
