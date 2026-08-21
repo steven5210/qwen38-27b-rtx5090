@@ -26,17 +26,49 @@ work to the ninfer server on this machine. Validated end-to-end on 2026-08-20.
 Why wsl.exe: the server runs inside WSL where 127.0.0.1:8080 is guaranteed reachable
 (same path every probe in this repo used). No Windows Python, no pip installs.
 
+## Adding it on a MacBook (reaches the PC over Tailscale)
+
+Requirements: Tailscale running on the Mac (same tailnet), the PC on with ninfer up,
+and python3 present (macOS: `python3 --version`; accept the Xcode tools prompt if asked).
+
+1. Make a folder, e.g. `~/qwen-mcp/`, containing:
+   - `qwen_mcp.py` (this repo)
+   - `api-key.txt` (same one line as on the PC)
+2. Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+    {
+      "mcpServers": {
+        "qwen-local": {
+          "command": "python3",
+          "args": ["-u", "/Users/YOURNAME/qwen-mcp/qwen_mcp.py"],
+          "env": {"QWEN_URL": "http://100.119.25.65:8080"}
+        }
+      }
+    }
+
+3. Fully quit Claude Desktop (Cmd+Q) and reopen. "run qwen_health" should say UP.
+
+Same server, same jobs, from the couch. Latency adds only the tailnet round-trip.
+
 ## Daily workflow
 
 1. START-NINFER.bat (or leave it running).
-2. In Claude, just ask: "delegate the implementation to qwen" -- or standing instruction:
+2. In Claude, just ask -- or better, add this standing instruction to your Claude
+   preferences/project. It makes Claude JUDGE each task instead of pattern-matching a
+   task list, with quality always ahead of token savings:
 
-   > For bounded implementation subtasks (specified functions, refactors, tests,
-   > summarizing big files), delegate to local Qwen: qwen_submit with a SELF-CONTAINED
-   > spec (goal, constraints, interfaces, needed file contents in context). Poll
-   > qwen_status, fetch qwen_result, then REVIEW the result yourself before using it.
-   > Escalate to doing it yourself after two failed attempts. qwen_ask (effort none/low)
-   > for quick lookups. Qwen shares no context with you -- include everything it needs.
+   > I have a local Qwen3.8-27B (252,928-token context, reasoning_effort xhigh) available
+   > through the qwen-local MCP tools. For any task or subtask, YOU decide whether to
+   > delegate to it: judge whether a strong 27B with huge context can do this at full
+   > quality -- bounded, precisely specifiable, and verifiable (tests or your own review
+   > can catch failures) -- rather than needing cross-cutting judgment or context only you
+   > hold. QUALITY ALWAYS BEATS TOKEN SAVINGS; when in doubt, do it yourself. If you
+   > delegate: write a fully self-contained spec (Qwen shares none of your context),
+   > review the result critically before using it, and take over yourself after two
+   > failed attempts. If I ask you to delegate something you judge unsuitable, push back
+   > with your reason and let me decide. Tell me briefly what you delegated or why you
+   > chose not to, and note whether delegated results needed fixes -- so the delegation
+   > judgment calibrates over time. Use qwen_ask (effort none/low) for quick lookups.
 
 ## The tools
 
