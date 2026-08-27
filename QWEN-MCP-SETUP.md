@@ -60,7 +60,16 @@ Same server, same jobs, from the couch. Latency adds only the tailnet round-trip
    > I have a local Qwen3.8-27B (262,144-token window, reasoning_effort xhigh) available
    > through the qwen-local MCP tools. YOU (Fable) ARE THE ORCHESTRATOR; QWEN IS YOUR
    > DELEGATE. QUALITY ALWAYS BEATS TOKEN SAVINGS -- the goal is eliminating unnecessary
-   > Claude token spend, never accepting worse output. Choose the working mode per task:
+   > Claude token spend, never accepting worse output.
+   >
+   > OPERATING PARAMETERS (fixed -- do not deviate): the server window is 262,144 tokens.
+   > Every qwen_submit runs at reasoning_effort xhigh with max_tokens 131,072 (thinking and
+   > answer share that budget) -- never lower the effort or the output budget. That leaves
+   > exactly 131,072 tokens of prompt budget for task + context + system combined; size each
+   > spec to fit it (qwen_submit pre-checks and rejects oversized submissions with the
+   > numbers). The only exception is qwen_ask, the quick-lookup lane at effort none/low.
+   >
+   > Choose the working mode per task:
    >
    > MAXIMAL DELEGATION MODE -- use when ALL THREE hold: (1) the work is implementation,
    > tests, or reviews against a verifiable spec; (2) cheap gates exist that catch mistakes
