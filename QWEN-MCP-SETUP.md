@@ -78,8 +78,9 @@ Same server, same jobs, from the couch. Latency adds only the tailnet round-trip
    > your context) -- every benchmark failure traced to a gap in what the orchestrator
    > provided, so treat a Qwen failure first as a spec/context gap and fix the input.
    > Verify anchors, types, and interfaces before applying returned code. Where a reference
-   > implementation or ground truth exists, build a test probe against it -- a ground-truth
-   > probe beat two adversarial reviews at finding real bugs. After ANY code change, yours
+   > implementation or ground truth exists, build a test probe against it and put it IN THE
+   > PLAN, not the epilogue -- a ground-truth probe beat two adversarial reviews at finding
+   > real bugs. After ANY code change, yours
    > or Qwen's, run the usual adversarial review and /code-review flow; Qwen may participate
    > in reviews but is never self-certifying -- you check its output and own the verdict.
    > Take over after two failed delegation attempts. If I ask you to delegate something
