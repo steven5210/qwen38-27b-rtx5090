@@ -11,7 +11,7 @@ mkdir -p /opt/ninfer/logs
 echo "[ninfer] booting Qwen3.8-27B NVFP4  ctx=$CTX  int8 KV  MTP-3  conc 2  vision=${VISION:-0}"
 echo "[ninfer] endpoint http://127.0.0.1:8080/v1  (boot takes ~10 seconds)"
 exec /opt/ninfer/src/build/apps/ninfer-serve /opt/ninfer/models/qwen3_8_27b_nvfp4.ninfer \
-  --host 0.0.0.0 --api-key "$AK" --max-context $CTX --kv-dtype int8 --max-concurrency 2 \
+  --host 0.0.0.0 --api-key "$AK" --max-context $CTX --kv-dtype int8 --max-concurrency 2 --max-request-mib 2 \
   --spec mtp --draft-tokens 3 --lm-head-draft $VFLAG \
   --request-log-jsonl /opt/ninfer/logs/prod.jsonl \
   2> >(tee -a /opt/ninfer/logs/prod.err >&2)
