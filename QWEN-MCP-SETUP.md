@@ -105,14 +105,16 @@ Same server, same jobs, from the couch. Latency adds only the tailnet round-trip
 | qwen_health | up/down, model, window, running jobs | instant |
 | qwen_ask | sync question, effort none/low, <=4K out | seconds |
 | qwen_submit | background job, default **effort xhigh, max_tokens 131,072**; `context_path` reads a local file (<=2MB) so huge contexts never go through tool parameters | returns instantly |
-| qwen_status | snapshot -- or `wait:true` BLOCKS until done/error (timeout_s default 120, max 600; clean still-running on timeout; wakes ~instantly on completion; other tools not blocked) | instant / blocking |
+| qwen_status | snapshot -- or `wait:true` BLOCKS until done/error (default 45s, hard-clamped 50s; CHAIN calls for multi-minute jobs; clean still-running at the clamp; wakes ~instantly on completion; other tools not blocked) | instant / blocking |
 | qwen_result | answer + usage (incl. cached_tokens); thinking omitted | instant |
 
 ## Timeouts and other gotchas (designed around)
 
-- **MCP ~60s client timeouts**: submit/result return in milliseconds. qwen_status
-  wait:true blocks by design -- if your client kills tool calls at ~60s, chain waits with
-  timeout_s: 55 (each is one turn; a killed wait costs nothing, the job keeps running).
+- **Why waits are clamped to 50s (v1.2)**: the MCP harness KILLS the whole server process
+  when a tool call blocks past ~60s -- that kill, not the wait, wiped the v1.1 job registry
+  and lost a running job. v1.2 hard-clamps every wait below the threshold and persists the
+  registry to <dir>/jobs/: finished results survive restarts, and a job in flight during a
+  kill returns clearly marked "lost:" instead of unknown. Chain wait calls for long jobs.
 - **Payload limit**: 2,000,000 bytes per submit (MCP pre-check with the size named in the
   error; server pinned to --max-request-mib 2). Use context_path for big files.
 - **Server down**: tools return a clear message telling Claude to have you run

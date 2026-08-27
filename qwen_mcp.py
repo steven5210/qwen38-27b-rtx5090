@@ -11,10 +11,13 @@ Tools:
   qwen_status(job_id, wait?, timeout_s?) -- snapshot, or BLOCK until done/error/timeout
   qwen_result(job_id)               -- the answer (+usage; thinking omitted by default)
 
-v1.1.0: qwen_status gains wait/timeout_s (completion push -- no polling loops);
-qwen_submit gains context_path (MCP reads the file locally and inlines it) and a hard
-2,000,000-byte payload cap with clear errors; tool calls now run on worker threads so a
-blocking wait never stalls other tool calls."""
+v1.1.0: wait/timeout_s on qwen_status (completion push); context_path on qwen_submit;
+2MB payload cap; worker-threaded tool calls.
+v1.2.0: waits are clamped to 50s max -- the MCP harness kills the whole server process on
+long-blocked tool calls, and that kill (not the wait itself) is what wiped the v1.1 job
+registry; chained sub-50s waits are the intended pattern for multi-minute jobs. The job
+registry now persists to <dir>/jobs/: finished results survive an MCP restart, and jobs
+that were in flight during a kill come back honestly marked lost instead of unknown."""
 import json, os, sys, threading, time, urllib.request, urllib.error, uuid
 
 BASE = os.environ.get("QWEN_URL", "http://127.0.0.1:8080")
@@ -24,12 +27,50 @@ except Exception: KEY = ""
 WINDOW = 262_144
 MAX_SYNC_TOKENS = 4096
 MAX_PAYLOAD_BYTES = 2_000_000   # hard cap on one submit's JSON body (server: --max-request-mib 2)
-WAIT_DEFAULT_S = 120.0
-WAIT_MAX_S = 600.0
+WAIT_DEFAULT_S = 45.0
+WAIT_MAX_S = 50.0   # below the MCP harness's tool-call kill threshold (~60s)
 JOBS = {}
 LOCK = threading.Lock()
 OUT_LOCK = threading.Lock()
 ACTIVE = threading.Semaphore(int(os.environ.get("QWEN_MCP_JOBS", "1")))  # be gentle to live Cline sessions
+JOBS_DIR = os.path.join(D, "jobs")
+PERSIST_KEYS = ("state", "started", "ended", "phase", "task_preview", "answer",
+                "thinking_chars", "usage", "error", "finish", "effort")
+
+def persist(jid):
+    try:
+        os.makedirs(JOBS_DIR, exist_ok=True)
+        j = JOBS[jid]
+        rec = {k: j.get(k) for k in PERSIST_KEYS}
+        tmp = os.path.join(JOBS_DIR, jid + ".tmp")
+        with open(tmp, "w") as f: json.dump(rec, f)
+        os.replace(tmp, os.path.join(JOBS_DIR, jid + ".json"))
+        files = sorted(f for f in os.listdir(JOBS_DIR) if f.endswith(".json"))
+        for old in files[:-50]:
+            try: os.remove(os.path.join(JOBS_DIR, old))
+            except Exception: pass
+    except Exception:
+        pass   # persistence is best-effort; never fail a tool call over it
+
+def load_persisted():
+    try: files = os.listdir(JOBS_DIR)
+    except Exception: return
+    for fn in files:
+        if not fn.endswith(".json"): continue
+        jid = fn[:-5]
+        try: rec = json.load(open(os.path.join(JOBS_DIR, fn)))
+        except Exception: continue
+        was_live = rec.get("state") in ("queued", "running")
+        if was_live:
+            rec["state"] = "error"
+            rec["error"] = ("lost: the MCP server process restarted while this job was in "
+                            "flight (harness kill or Claude restart). Resubmit it.")
+            rec["ended"] = rec.get("ended") or time.time()
+        rec["event"] = threading.Event(); rec["event"].set()
+        JOBS[jid] = rec
+        if was_live: persist(jid)
+
+load_persisted()
 
 def http(path, body=None, timeout=8):
     headers = {"Authorization": "Bearer " + KEY}
@@ -46,6 +87,7 @@ def run_job(jid, body):
     with ACTIVE:
         j = JOBS[jid]
         j["state"] = "running"
+        persist(jid)
         try:
             body["stream"] = True
             with http("/v1/chat/completions", body, timeout=3900) as r:
@@ -69,12 +111,13 @@ def run_job(jid, body):
         except Exception as e:
             j["state"] = "error"; j["error"] = "%s: %s" % (type(e).__name__, e)
         j["ended"] = time.time()
+        persist(jid)
         j["event"].set()   # completion push: wake any qwen_status wait instantly
 
 def t_health(args):
     try:
         m = json.loads(http("/v1/models", timeout=4).read().decode())
-        return ("UP -- model %s at %s, window %s tokens. Jobs: %s" %
+        return ("UP -- model %s at %s, window %s tokens (qwen-local v1.2.0). Jobs: %s" %
                 (m["data"][0]["id"], BASE, format(WINDOW, ","),
                  {k: v["state"] for k, v in JOBS.items()} or "none"))
     except Exception as e:
@@ -134,10 +177,11 @@ def t_submit(args):
                      "task_preview": task[:120], "answer": "", "thinking_chars": 0,
                      "usage": None, "error": None, "finish": None, "effort": eff,
                      "event": threading.Event()}
+    persist(jid)
     threading.Thread(target=run_job, args=(jid, body), daemon=True).start()
     return ("Job %s submitted (effort=%s, max_tokens=%s, prompt ~%s tokens, body %s bytes). "
-            "Use qwen_status with wait:true to block until it finishes; typical xhigh jobs "
-            "think for 2-10 minutes." %
+            "Use qwen_status with wait:true to block until it finishes (chain waits for "
+            "multi-minute jobs); typical xhigh jobs think for 2-10 minutes." %
             (jid, eff, format(maxtok, ","), format(need, ","), format(body_bytes, ",")))
 
 def status_payload(j, waited=None):
@@ -148,7 +192,9 @@ def status_payload(j, waited=None):
     if waited is not None:
         out["waited_s"] = round(waited, 1)
         if j["state"] in ("queued", "running"):
-            out["note"] = "still running -- wait timed out cleanly; call qwen_status wait:true again"
+            out["note"] = ("still running -- wait returned cleanly at the safety clamp; "
+                           "call qwen_status wait:true again (chained waits are the "
+                           "intended pattern for multi-minute jobs)")
     return json.dumps(out)
 
 def t_status(args):
@@ -183,7 +229,7 @@ TOOLS = [
       inputSchema={"type": "object", "properties": {}, "required": []}),
  dict(name="qwen_ask", description="Quick synchronous question to local Qwen (effort none|low, <=4K output, seconds). For implementation tasks use qwen_submit.",
       inputSchema={"type": "object", "properties": {"question": {"type": "string"}, "effort": {"type": "string", "enum": ["none", "low"]}}, "required": ["question"]}),
- dict(name="qwen_submit", description="Delegate a bounded task (coding implementation, refactor, tests, summarization) to local Qwen as a background job at reasoning_effort xhigh by default. Write a SELF-CONTAINED spec: goal, constraints, interfaces; put needed file contents in context, or point context_path at a local file the MCP will read and inline (<=2MB; avoids pasting huge strings through tool parameters). Returns a job_id immediately. Then qwen_status with wait:true blocks until completion -- no polling loops.",
+ dict(name="qwen_submit", description="Delegate a bounded task (coding implementation, refactor, tests, summarization) to local Qwen as a background job at reasoning_effort xhigh by default. Write a SELF-CONTAINED spec: goal, constraints, interfaces; put needed file contents in context, or point context_path at a local file the MCP will read and inline (<=2MB; avoids pasting huge strings through tool parameters). Returns a job_id immediately. Then chain qwen_status wait:true calls until completion -- no polling loops.",
       inputSchema={"type": "object", "properties": {
           "task": {"type": "string", "description": "the complete self-contained spec"},
           "context": {"type": "string", "description": "file contents / code the task needs (inline)"},
@@ -192,12 +238,12 @@ TOOLS = [
           "effort": {"type": "string", "enum": ["none", "low", "medium", "xhigh"]},
           "max_tokens": {"type": "integer", "description": "output budget, default 131072 (thinking+answer)"}},
           "required": ["task"]}),
- dict(name="qwen_status", description="Progress of a qwen_submit job. Default: instant snapshot (state, phase thinking/answering, elapsed, sizes). With wait:true it BLOCKS until the job reaches done/error or timeout_s elapses (default 120, max 600), then returns the same payload -- a clean 'still running' note on timeout, never an error. Waking is push-based: it fires within ~1s of actual completion. Other tool calls are not blocked while waiting.",
+ dict(name="qwen_status", description="Progress of a qwen_submit job. Default: instant snapshot (state, phase thinking/answering, elapsed, sizes). With wait:true it BLOCKS until the job reaches done/error or timeout_s elapses (default 45, hard-clamped to 50 so the MCP harness never kills the server process), then returns the same payload -- a clean 'still running' note at the clamp, never an error. For multi-minute jobs CHAIN wait calls back-to-back: each is one turn, waking fires within ~1s of actual completion, no sleep-timer math needed. Other tool calls are not blocked while waiting. Finished results persist to disk and survive MCP restarts.",
       inputSchema={"type": "object", "properties": {"job_id": {"type": "string"},
           "wait": {"type": "boolean", "description": "block until done/error or timeout_s"},
-          "timeout_s": {"type": "number", "description": "max seconds to block (default 120, max 600)"}},
+          "timeout_s": {"type": "number", "description": "max seconds to block (default 45, clamped to 50 -- chain calls for longer jobs)"}},
           "required": ["job_id"]}),
- dict(name="qwen_result", description="Fetch the finished answer of a qwen_submit job (with usage stats; thinking not returned).",
+ dict(name="qwen_result", description="Fetch the finished answer of a qwen_submit job (with usage stats; thinking not returned). Served from the persisted registry, so results survive MCP restarts.",
       inputSchema={"type": "object", "properties": {"job_id": {"type": "string"}, "include_thinking": {"type": "boolean"}}, "required": ["job_id"]}),
 ]
 HANDLERS = {"qwen_health": t_health, "qwen_ask": t_ask, "qwen_submit": t_submit,
@@ -228,7 +274,7 @@ def main():
         if meth == "initialize":
             reply(mid, {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"),
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "qwen-local", "version": "1.1.0"}})
+                        "serverInfo": {"name": "qwen-local", "version": "1.2.0"}})
         elif meth == "notifications/initialized": continue
         elif meth == "ping": reply(mid, {})
         elif meth == "tools/list": reply(mid, {"tools": TOOLS})
