@@ -9,14 +9,24 @@ START-NINFER / STOP-NINFER transitions automatically):
 Flicker-free: alternate screen buffer, cursor hidden, frames rewritten line-by-line
 with EOL clears -- the screen is never blanked. QMON.bat / NMON.bat / MONITOR.bat all
 launch this. Ctrl+C or close the window to quit; servers are unaffected.
+
+v2 (2026-08-27): idle-aware now-stats (decode/sparkline drop to 0 the moment the queue
+drains -- the last throughput line is only "now" while it is fresh AND reports work),
+incremental log follow from byte 0 (session totals are exact for the whole server
+session, not a 2MB tail), a state line (IDLE with time-since-last-request /
+GENERATING with elapsed + ~tokens-so-far integrated from the 5s throughput lines +
+max_tokens/thinking/tools from the submit line, plus a stall detector), a session
+token-totals line, and a richer last-req line (out @ tok/s, wall). Env for testing:
+QMON_ERR (log path), QMON_FORCE_STACK=ninfer (skip probing).
 """
 import json, os, re, shutil, subprocess, sys, time, urllib.request
 
 D = os.path.dirname(os.path.abspath(__file__))
 NIN = os.environ.get("QMON_NINFER", "http://127.0.0.1:8080")
 VLL = os.environ.get("QMON_VLLM",   "http://127.0.0.1:8000")
-ERR = "/opt/ninfer/logs/prod.err"
+ERR = os.environ.get("QMON_ERR", "/opt/ninfer/logs/prod.err")
 SERVE_LOG = os.path.join(D, "logs", "serve.log")
+FORCE = os.environ.get("QMON_FORCE_STACK")
 try: KEY = open(os.path.join(D, "api-key.txt")).read().strip()
 except Exception: KEY = ""
 HDRS = {"Authorization": "Bearer " + KEY} if KEY else {}
@@ -99,7 +109,122 @@ RE_DONE = re.compile(
     r"\[req (\d+)\] done finish=(\S+)(?: tool_calls=(\d+))? prompt=(\d+) gen=(\d+) cache=(\d+) "
     r"reuse=(\S+) ttft=(\d+)ms(?: prefill=([\d.]+)tok/s)?(?: decode=([\d.]+)tok/s)?"
     r"(?: wall=([\d.]+)s)?(?: speculative=\S+ ([\d.]+)tok/round \(([\d.]+)%\))?")
-RE_THR  = re.compile(r"throughput interval=[\d.]+s prefill=([\d.]+)tok/s decode=([\d.]+)tok/s running=(\d+) prefilling=(\d+) decode_ready=(\d+) waiting=(\d+)")
+RE_THR  = re.compile(r"throughput interval=([\d.]+)s prefill=([\d.]+)tok/s decode=([\d.]+)tok/s running=(\d+) prefilling=(\d+) decode_ready=(\d+) waiting=(\d+)")
+RE_TS   = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\.(\d{3})\]")
+
+def line_ts(l):
+    m = RE_TS.match(l)
+    if not m: return None
+    try:
+        return time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")) + int(m.group(2)) / 1000.0
+    except Exception:
+        return None
+
+def fmt_dur(s):
+    s = max(0, int(s))
+    if s < 90: return "%ds" % s
+    if s < 3600: return "%dm%02ds" % (s // 60, s % 60)
+    return "%dh%02dm" % (s // 3600, s % 3600 // 60)
+
+class NinferLog:
+    """Incremental follower of ninfer's prod.err. The file is truncated at every
+    server boot, so parsing from byte 0 makes the accumulated stats exactly the
+    server session. Only new bytes are read each frame; a size drop means the
+    server rebooted and all session state resets."""
+    def __init__(self, path):
+        self.path = path
+        self.reset()
+    def reset(self):
+        self.off = 0
+        self.buf = b""
+        self.reqs = []            # completed requests (display window; sums are lifetime)
+        self.sums = {"n": 0, "p": 0, "g": 0, "c": 0, "ttft_ms": 0, "wall": 0.0,
+                     "dec_g": 0, "dec_t": 0.0, "mtp_g": 0, "mtp_gx": 0.0}
+        self.fin = {}
+        self.subs = {}            # req id -> {"ts","max_tokens","tools","thinking"} while in flight
+        self.thr = None           # last throughput line, parsed
+        self.live_gen = 0.0       # ~tokens generated across the current in-flight request(s)
+    def poll(self):
+        try: size = os.path.getsize(self.path)
+        except Exception: return
+        if size < self.off: self.reset()          # truncated -> new server session
+        if size == self.off: return
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.off)
+                data = self.buf + f.read(size - self.off)
+                self.off = size
+        except Exception:
+            return
+        lines = data.split(b"\n")
+        self.buf = lines.pop()                    # keep any partial trailing line
+        for raw in lines:
+            self._line(raw.decode("utf-8", "replace"))
+    def _line(self, l):
+        if "throughput interval=" in l:
+            m = RE_THR.search(l)
+            if not m: return
+            iv, pre, dec = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            self.thr = {"ts": line_ts(l), "interval": iv, "prefill": pre, "decode": dec,
+                        "running": int(m.group(4)), "prefilling": int(m.group(5)),
+                        "ready": int(m.group(6)), "waiting": int(m.group(7))}
+            if self.subs and dec > 0:
+                self.live_gen += dec * iv
+            return
+        if "] done " in l:
+            m = RE_DONE.search(l)
+            if not m: return
+            r = {"id": m.group(1), "finish": m.group(2), "p": int(m.group(4)),
+                 "g": int(m.group(5)), "c": int(m.group(6)), "path": m.group(7),
+                 "ttft_ms": int(m.group(8)), "prefill": m.group(9), "dec": m.group(10),
+                 "wall": float(m.group(11)) if m.group(11) else None,
+                 "mtp_r": m.group(12), "mtp": m.group(13), "ts": line_ts(l)}
+            self.reqs.append(r); self.reqs[:] = self.reqs[-500:]
+            s = self.sums
+            s["n"] += 1; s["p"] += r["p"]; s["g"] += r["g"]; s["c"] += r["c"]
+            s["ttft_ms"] += r["ttft_ms"]
+            if r["wall"]: s["wall"] += r["wall"]
+            if r["dec"] and float(r["dec"]) > 0:
+                s["dec_g"] += r["g"]; s["dec_t"] += r["g"] / float(r["dec"])
+            if r["mtp"]:
+                s["mtp_g"] += r["g"]; s["mtp_gx"] += r["g"] * float(r["mtp"])
+            self.fin[r["finish"]] = self.fin.get(r["finish"], 0) + 1
+            self.subs.pop(r["id"], None)
+            self.live_gen = max(0.0, self.live_gen - r["g"]) if self.subs else 0.0
+            return
+        if "] openai_" in l and "submitted" in l:
+            mi = re.search(r"\[req (\d+)\]", l)
+            if not mi: return
+            def grab(pat):
+                mm = re.search(pat, l); return mm.group(1) if mm else None
+            self.subs[mi.group(1)] = {"ts": line_ts(l),
+                                      "max_tokens": grab(r"max_tokens=(\d+)"),
+                                      "tools": grab(r"tools=(\d+)"),
+                                      "thinking": grab(r"thinking=(\w+)")}
+            return
+        m = re.search(r"\[req (\d+)\][^\n]*?(error|failed|abort|cancel|disconnect)", l, re.I)
+        if m:
+            self.subs.pop(m.group(1), None)
+            if not self.subs: self.live_gen = 0.0
+    def now_state(self, now):
+        """-> (active, dec_now, pre_now, run, wai, stall_secs).
+        Idle the moment the last throughput line reports empty queues, or when
+        throughput lines stop arriving (they print every ~5s only while working)."""
+        t = self.thr
+        fresh = bool(t and t["ts"] and now - t["ts"] <= 7.5)
+        queues0 = bool(t) and (t["running"] + t["prefilling"] + t["ready"] + t["waiting"] == 0)
+        if self.subs and fresh and queues0:
+            self.subs.clear(); self.live_gen = 0.0   # ended without a done line (client gone)
+        active = bool(self.subs) or (fresh and not queues0)
+        dec_now = t["decode"] if (t and fresh and active) else 0.0
+        pre_now = t["prefill"] if (t and fresh and active) else 0.0
+        run = t["running"] if (t and fresh) else (1 if self.subs else 0)
+        wai = t["waiting"] if (t and fresh) else 0
+        stall = 0.0
+        if self.subs and not fresh:
+            ref = t["ts"] if (t and t["ts"]) else max(v["ts"] or now for v in self.subs.values())
+            stall = now - ref
+        return active, dec_now, pre_now, run, wai, stall
 
 class Screen:
     def __init__(self, once):
@@ -133,6 +258,7 @@ def main():
     model = None; boot_t0 = time.time(); up_secs = None
     vr_u = vr_t = None; vr_base = None; tick = 0
     dec_hist = []           # decode tok/s history for sparkline
+    nlog = NinferLog(ERR)   # incremental session parser (survives stack-probe blips)
     # vLLM state
     prev_gen = None; prev_t = None; ema = None; ring = []; pool = None; mml = None
 
@@ -147,11 +273,14 @@ def main():
                 if u: vr_u, vr_t = u, t
 
             # ---- detect / follow the live stack ----
-            mid = probe(NIN)
-            new_stack = "ninfer" if mid else None
-            if not new_stack:
-                mid = probe(VLL)
-                new_stack = "vllm" if mid else None
+            if FORCE:
+                mid = model or "qwen3.8-27b"; new_stack = FORCE
+            else:
+                mid = probe(NIN)
+                new_stack = "ninfer" if mid else None
+                if not new_stack:
+                    mid = probe(VLL)
+                    new_stack = "vllm" if mid else None
             if new_stack != stack:
                 stack = new_stack; model = mid
                 vr_base = None; dec_hist = []; ring = []; prev_gen = None; ema = None
@@ -184,68 +313,94 @@ def main():
             elif stack == "ninfer":
                 srv_ctx, srv_vision = server_profile()
                 ctx = srv_ctx or conf_ctx() or 252928
-                txt = tail_file(ERR, 2_000_000)
-                reqs = [RE_DONE.search(l) for l in txt.splitlines() if "] done " in l]
-                reqs = [m for m in reqs if m]
-                thr  = [RE_THR.search(l) for l in txt.splitlines() if "throughput" in l]
-                thr  = [m for m in thr if m]
-                pre = dec = 0.0; run = wai = 0
-                if thr:
-                    t_ = thr[-1]; pre, dec = float(t_.group(1)), float(t_.group(2))
-                    run, wai = int(t_.group(3)), int(t_.group(6))
+                nlog.poll()
+                active, dec, pre, run, wai, stall = nlog.now_state(now)
                 dec_hist.append(dec); dec_hist[:] = dec_hist[-60:]
+                s = nlog.sums; reqs = nlog.reqs
                 L.append("  " + col("READY", "g") + "  %s  " % model +
                          (col("VISION", "c") + "  " if srv_vision else "") +
                          col("ninfer :8080  window %s (server-reported)  up %s" %
                              (fmt_tok(ctx), fmt_up(up_secs)), "d"))
                 L.append(H)
-                if reqs:
-                    m_ = reqs[-1]
-                    p_, g_, c_ = int(m_.group(4)), int(m_.group(5)), int(m_.group(6))
-                    path, ttft = m_.group(7), int(m_.group(8)) / 1000.0
-                    pct = p_ / ctx
-                    L.append("  context   [%s] %s / %s  %d%%" %
-                             (bar(pct, width - 42), fmt_tok(p_), fmt_tok(ctx), round(100 * pct)))
-                    glyph = {"append_frontier": col("append ✓", "g"),
-                             "full_reset": col("reset", "y")}.get(path,
-                             col(path.replace("restore_", "restore ") + " ↻", "c"))
-                    L.append(col("  last req  ", "d") + "prompt %s   cached %s (%d%%)   %s   ttft %.2fs" %
-                             (fmt_tok(p_), fmt_tok(c_), round(100.0 * c_ / p_) if p_ else 0, glyph, ttft))
-                    # ---- session aggregates from the completion lines ----
-                    P = [int(m.group(4)) for m in reqs]; G = [int(m.group(5)) for m in reqs]
-                    CC = [int(m.group(6)) for m in reqs]; T = [int(m.group(8)) for m in reqs]
-                    DEC = [(g, float(m.group(10))) for g, m in zip(G, reqs) if m.group(10)]
-                    WALL = [float(m.group(11)) for m in reqs if m.group(11)]
-                    ACC = [(g, float(m.group(13))) for g, m in zip(G, reqs) if m.group(13)]
-                    def wavg(pairs):
-                        tt = sum(g / r for g, r in pairs if r > 0); gg = sum(g for g, r in pairs)
-                        return gg / tt if tt > 0 else 0.0
-                    avg_dec = wavg(DEC); last10_dec = wavg(DEC[-10:])
-                    fin = {}
-                    for m in reqs: fin[m.group(2)] = fin.get(m.group(2), 0) + 1
-                    fintxt = " · ".join("%s %d" % (k.replace("tool_calls", "tool"), v) for k, v in sorted(fin.items()))
-                    ntr = fin.get("length", 0) + fin.get("output_limit", 0)
-                    if ntr: fintxt = col(fintxt + "  << %d truncated (raise max output?)" % ntr, "y")
-                    hits = [c for c in CC if c > 0]
-                    busy = min(1.0, sum(WALL) / max(1.0, up_secs or 1)) if WALL else 0.0
-                    L.append("  requests  running %d  waiting %d      finish: %s" % (run, wai, fintxt))
-                    L.append("  decode    %7.1f tok/s now  %s" % (dec, col(spark(dec_hist, width - 58), "c")) +
-                             col("  avg %5.1f · last-10 %5.1f" % (avg_dec, last10_dec), "d"))
-                    L.append("  prefill   %7.1f tok/s now   last req %s tok/s" %
-                             (pre, m_.group(9) or "--"))
-                    if ACC:
-                        sess_acc = sum(g * a2 for g, a2 in ACC) / max(1, sum(g for g, _ in ACC))
-                        L.append("  mtp       %s%% accept last (%s tok/round)   session %.1f%%" %
-                                 (m_.group(13) or "--", m_.group(12) or "-", sess_acc))
-                    L.append("  ttft      last %.2fs · last-10 avg %.2fs · session avg %.2fs" %
-                             (ttft, sum(T[-10:]) / len(T[-10:]) / 1000.0, sum(T) / len(T) / 1000.0))
-                    L.append("  session   %d reqs · out %s · prompt %s (%s%% served from cache) · busy %d%%" %
-                             (len(reqs), fmt_tok(sum(G)), fmt_tok(sum(P)),
-                              round(100.0 * sum(CC) / sum(P)) if sum(P) else 0, round(100 * busy)))
+                # ---- state line: what is happening RIGHT NOW ----
+                if nlog.subs:
+                    ids = sorted(nlog.subs, key=lambda k: int(k))
+                    sub = nlog.subs[ids[0]]
+                    el = (now - sub["ts"]) if sub["ts"] else 0
+                    if len(ids) == 1:
+                        seg = "GENERATING #%s · %s" % (ids[0], fmt_dur(el))
+                        if nlog.live_gen > 0:
+                            seg += " · ~%s tok so far" % fmt_tok(nlog.live_gen)
+                            if sub["max_tokens"]: seg += " (max %s)" % fmt_tok(int(sub["max_tokens"]))
+                        fl = []
+                        if sub["thinking"]: fl.append("thinking %s" % sub["thinking"])
+                        if sub["tools"] and sub["tools"] != "0": fl.append("tools %s" % sub["tools"])
+                        if fl: seg += " · " + " · ".join(fl)
+                    else:
+                        seg = "GENERATING %d reqs (#%s) · oldest %s" % (len(ids), " #".join(ids), fmt_dur(el))
+                        if nlog.live_gen > 0: seg += " · ~%s tok combined" % fmt_tok(nlog.live_gen)
+                    state_ln = "  state     " + col(seg, "c")
+                    if stall > 12:
+                        state_ln += "  " + col("no throughput for %s -- possible stall" % fmt_dur(stall),
+                                               "r" if stall > 60 else "y")
+                    state_line = state_ln
+                elif reqs:
+                    ago = fmt_dur(now - reqs[-1]["ts"]) if reqs[-1]["ts"] else "--"
+                    state_line = "  state     " + col("IDLE · %s since last request" % ago, "d")
                 else:
-                    L.append("  requests  running %d  waiting %d      (no completions logged yet)" % (run, wai))
-                    L.append("  decode    %7.1f tok/s  %s" % (dec, col(spark(dec_hist, width - 40), "c")))
-                    L.append("  prefill   %7.1f tok/s" % pre)
+                    state_line = "  state     " + col("IDLE · no requests yet this session", "d")
+                if reqs:
+                    r = reqs[-1]
+                    pct = r["p"] / ctx
+                    L.append("  context   [%s] %s / %s  %d%%" %
+                             (bar(pct, width - 42), fmt_tok(r["p"]), fmt_tok(ctx), round(100 * pct)))
+                    glyph = {"append_frontier": col("append ✓", "g"),
+                             "full_reset": col("reset", "y")}.get(r["path"],
+                             col(r["path"].replace("restore_", "restore ") + " ↻", "c"))
+                    seg = "prompt %s · cached %s (%d%%) · %s · out %s" % (
+                        fmt_tok(r["p"]), fmt_tok(r["c"]),
+                        round(100.0 * r["c"] / r["p"]) if r["p"] else 0, glyph, fmt_tok(r["g"]))
+                    if r["dec"]: seg += " @ %s tok/s" % r["dec"]
+                    if r["wall"]: seg += " · wall %s" % fmt_dur(r["wall"])
+                    seg += " · ttft %.2fs" % (r["ttft_ms"] / 1000.0)
+                    L.append(col("  last req  ", "d") + seg)
+                    L.append(state_line)
+                    fintxt = " · ".join("%s %d" % (k.replace("tool_calls", "tool"), v)
+                                        for k, v in sorted(nlog.fin.items()))
+                    ntr = nlog.fin.get("length", 0) + nlog.fin.get("output_limit", 0)
+                    if ntr: fintxt = col(fintxt + "  << %d truncated (raise max output?)" % ntr, "y")
+                    left = "  requests  running %d · waiting %d" % (run, wai)
+                    L.append((col(left, "y") if wai else left) + "      finish: %s" % fintxt)
+                    last10 = reqs[-10:]
+                    def wavg(pairs):
+                        tt = sum(g / rr for g, rr in pairs if rr > 0); gg = sum(g for g, rr in pairs)
+                        return gg / tt if tt > 0 else 0.0
+                    d10 = [(r2["g"], float(r2["dec"])) for r2 in last10 if r2["dec"]]
+                    avg_dec = s["dec_g"] / s["dec_t"] if s["dec_t"] > 0 else 0.0
+                    L.append("  decode    %7.1f tok/s now  %s" % (dec, col(spark(dec_hist, width - 58), "c")) +
+                             col("  avg %5.1f · last-10 %5.1f" % (avg_dec, wavg(d10)), "d"))
+                    L.append("  prefill   %7.1f tok/s now   last req %s tok/s" % (pre, r["prefill"] or "--"))
+                    if s["mtp_g"]:
+                        L.append("  mtp       %s%% accept last (%s tok/round)   session %.1f%%" %
+                                 (r["mtp"] or "--", r["mtp_r"] or "-", s["mtp_gx"] / s["mtp_g"]))
+                    t10 = [r2["ttft_ms"] for r2 in last10]
+                    L.append("  ttft      last %.2fs · last-10 avg %.2fs · session avg %.2fs" %
+                             (r["ttft_ms"] / 1000.0, sum(t10) / len(t10) / 1000.0,
+                              s["ttft_ms"] / s["n"] / 1000.0))
+                    L.append("  tokens    prompt %s + out %s = %s session total · cache-served %s (%d%%)" %
+                             (fmt_tok(s["p"]), fmt_tok(s["g"]), fmt_tok(s["p"] + s["g"]),
+                              fmt_tok(s["c"]), round(100.0 * s["c"] / s["p"]) if s["p"] else 0))
+                    c10p = sum(r2["p"] for r2 in last10)
+                    busy = min(1.0, s["wall"] / max(1.0, up_secs or 1)) if s["wall"] else 0.0
+                    L.append("  session   %d req%s · busy %d%% · cache hit last-10 %d%%" %
+                             (s["n"], "" if s["n"] == 1 else "s", round(100 * busy),
+                              round(100.0 * sum(r2["c"] for r2 in last10) / c10p) if c10p else 0))
+                else:
+                    L.append(state_line)
+                    reqline = "  requests  running %d · waiting %d      (no completions logged yet)" % (run, wai)
+                    L.append(col(reqline, "y") if wai else reqline)
+                    L.append("  decode    %7.1f tok/s now  %s" % (dec, col(spark(dec_hist, width - 40), "c")))
+                    L.append("  prefill   %7.1f tok/s now" % pre)
             else:  # vllm
                 try:
                     mtx = {}
@@ -308,16 +463,14 @@ def main():
                     st = col("[OK -- fixed pool, slim free is by design]", "g") if growth < 400 else \
                          col("[CAUTION +%d MiB above boot baseline -- desktop apps eating VRAM?]" % growth, "y")
                 L.append("  vram      %s / %s MiB   free %s   %s" % (fmt_tok(vr_u), fmt_tok(vr_t), fmt_tok(free), st))
-            if stack == "ninfer":
-                txt2 = locals().get("reqs") or []
-                if len(txt2) >= 2:
-                    L.append(H)
-                    L.append(col("  recent", "d"))
-                    for m_ in txt2[-4:][::-1]:
-                        L.append(col("    #%-4s %9sp %9sc  %-16s %5.2fs ttft  %6s tok/s  %s%%mtp" %
-                                 (m_.group(1), fmt_tok(m_.group(4)), fmt_tok(m_.group(6)),
-                                  m_.group(7)[:16], int(m_.group(8)) / 1000.0,
-                                  m_.group(10) or "--", m_.group(13) or "--"), "d"))
+            if stack == "ninfer" and len(nlog.reqs) >= 2:
+                L.append(H)
+                L.append(col("  recent", "d"))
+                for r_ in nlog.reqs[-4:][::-1]:
+                    L.append(col("    #%-4s %9sp %9sc %8sg  %-16s %5.2fs ttft  %6s tok/s  %s%%mtp" %
+                             (r_["id"], fmt_tok(r_["p"]), fmt_tok(r_["c"]), fmt_tok(r_["g"]),
+                              r_["path"][:16], r_["ttft_ms"] / 1000.0,
+                              r_["dec"] or "--", r_["mtp"] or "--"), "d"))
             L.append(H)
             L.append(col("  Ctrl+C or close window to quit -- servers unaffected", "d"))
             scr.draw(L)

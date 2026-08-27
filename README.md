@@ -139,7 +139,7 @@ with `--host 0.0.0.0` (API-key gated): Tailscale lives *inside* WSL here, and ni
 is loopback-only — the one connectivity difference from vLLM's `--host 0.0.0.0` that bites
 remote clients. **QMON** is the unified live monitor (`QMON.bat`; NMON.bat / MONITOR.bat are aliases):
 flicker-free alt-screen rendering, follows whichever stack is up, context bar + reuse path +
-TTFT per request, decode sparkline, real process uptime, and VRAM alarms (measured paging
+TTFT per request, decode sparkline, idle-aware now-stats with a state line (IDLE with time-since-last-request / GENERATING with elapsed + ~tokens-so-far + a stall detector), session token totals, real process uptime, and VRAM alarms (measured paging
 thresholds on vLLM; growth-above-boot-baseline on ninfer). `STOP-ALL.bat` stops *everything* — ninfer, vLLM, stray builds — and
 restarts nothing, printing an empty-port list + GPU memory as proof (the button you want when
 a heavy system job needs the whole machine).
