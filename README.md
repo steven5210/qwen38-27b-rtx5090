@@ -205,6 +205,26 @@ TTFT), `conc2big.py` (admission), `endure.py` (`CTX_SIZES` env), `cachehit-eval.
 `phase2b.sh` / `phase2c.sh` / `phase2d.sh` (the exact batteries), `nfix_patch.py` +
 `nfix2_patch.py` (the parser fixes as applied). All honor `TARGET_URL`/`QWEN_URL`/`EVAL_URL`.
 
+### Upstream watch (2026-08-27): the host-KV rearchitecture
+
+Upstream landed 68 commits (Aug 24-27) rebuilding the cache into a hierarchical host-KV
+design (shared stable prefixes, private continuations, device/host state slots, pinned host
+KV with on-demand materialization) and adopted our schema-typed tool fix in-tree (#66,
+`0e4cdf8` -- stock now scores 20/20 on toolab, superseding our two parser commits).
+Measured verdicts on stock at that head:
+
+- **Config-sensitive to a fault**: with our old flags at 262,144, interleave collapsed to
+  81s late-turn TTFT (host-tier defaults mistuned for this box). With their documented
+  recipe (`--max-context 240000 --device-state-slots 2 --host-state-slots 8
+  --host-kv-mib 8192`): **interleave 2.88s (beats our fork's 3.18s), SEQ 4.25s @ 100K,
+  vision healthy at 192,512** -- their host tier supersedes our residency patch too.
+- Their documented ceiling for this card is 240,000 (vs our 262,144) -- the one dimension
+  where our fork still leads.
+
+**Decision: hold on our fork; migrate deliberately after the churn settles**, using their
+recipe verbatim, rerunning the full battery, and porting only `cached_tokens` if their chat
+usage still lacks it. Diagnostics: `nup2.log`/`nup4.log`; stock worktree at `/opt/ninfer/up`.
+
 ### The context ceilings, measured — and the Wallpaper Engine plot twist
 
 Three rounds of testing on 2026-08-21, with a mid-experiment discovery that overturned the
