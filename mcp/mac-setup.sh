@@ -16,7 +16,7 @@ echo "python3: $(python3 --version 2>&1)"
 
 mkdir -p "$HOME/qwen-mcp"
 echo "downloading qwen_mcp.py ..."
-curl -fsSL "$RAW/qwen_mcp.py" -o "$HOME/qwen-mcp/qwen_mcp.py"
+curl -fsSL "$RAW/mcp/qwen_mcp.py" -o "$HOME/qwen-mcp/qwen_mcp.py"
 
 if [ ! -s "$HOME/qwen-mcp/api-key.txt" ]; then
   printf 'PASTE-YOUR-KEY-HERE' > "$HOME/qwen-mcp/api-key.txt"

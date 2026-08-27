@@ -18,6 +18,7 @@ makes a server *silently* 27x slower after a few minutes of use, with no error a
 ## Table of contents
 
 - [Quick reference](#quick-reference)
+- [Repository layout](#repository-layout)
 - [Part I — ninfer in production](#part-i--ninfer-in-production)
   - [Running it for real: the Phase-3 kit](#running-it-for-real-the-phase-3-kit)
   - [Cline settings on ninfer — both profiles](#cline-settings-on-ninfer--both-profiles)
@@ -99,6 +100,29 @@ Engine off (WE-tolerant fallbacks: 252,928 / 152,576). vLLM fallback client sett
 4. **Raising `--max-num-batched-tokens` on vLLM** → looks like a prefill optimization,
    silently makes the server 27x slower after ten minutes.
 
+## Repository layout
+
+Files are grouped by what they belong to; **the deployed working folder stays flat**.
+Every launcher finds its companions either beside itself (`%~dp0`) or at the fixed
+working-folder path, so the kit *runs* from one flat folder (ours:
+`C:\Users\StevenPC\Downloads\qwen38`) — the folders here are for reading, diffing, and
+pulling updates. Setting up fresh? Step 0 of Part II flattens the kit for you.
+
+| Folder | Contents |
+|---|---|
+| `ninfer/` | The production kit: `START-NINFER.bat` / `STOP-NINFER.bat` / `STOP-ALL.bat`, `ninfer-prod.conf`, the boot/stop scripts |
+| `monitor/` | QMON, the unified flicker-free dashboard (`qmon.py` + its three launcher aliases) |
+| `mcp/` | `qwen_mcp.py` (the Claude delegation MCP server), `mac-setup.sh` (Mac installer), `mcptest.py` (stdio harness) |
+| `cli/` | One-off ask launchers: the `QWEN-ASK.bat` menu, ASK-XHIGH / ASK-MEDIUM / ASK-FAST, `ask-xhigh.py` |
+| `vllm/` | The fallback stack: `SETUP.bat` + provisioning, `serve-wsl.sh`, its profile launchers, `killall-vllm.sh` |
+| `patches/` | The four assert-guarded ninfer patchers (`nfix*_patch.py`) and the residency worktree scripts |
+| `bench/` | Every harness behind the numbers in this README: `codeeval.py`, `toolab.py`, `needleprobe.py`, `cachehit-eval.py`, `clinesim.py`, the probes |
+| `docs/` | `QWEN-MCP-SETUP.md` (delegation playbook), `CLINE-NINFER.md`, `RESIDENCY-DESIGN.md`, the upstream issue draft |
+| `archive/` | Superseded but real: old monitors, the retired 5am maintenance task, the one-off Phase-2/3 batteries — [why each is here](archive/README.md) |
+
+Root keeps this README and `PUSH-TO-GITHUB.bat` (it publishes whatever folder it sits in,
+so it must stay at top level).
+
 ---
 
 ## Part I — ninfer in production
@@ -109,7 +133,7 @@ Boot it, point Cline at it, done.
 ### Running it for real: the Phase-3 kit
 
 `START-NINFER.bat` boots the validated production profile in ~10 seconds (config in
-`ninfer-prod.conf`, monitor window auto-opens via `nmon.py` — READY state, VRAM alarms,
+`ninfer-prod.conf`, monitor window auto-opens via `qmon.py` — READY state, VRAM alarms,
 reuse tallies, throughput). `STOP-NINFER.bat` is one click back to the vLLM stack (via `stop-ninfer.sh`). The kit boots
 with `--host 0.0.0.0` (API-key gated): Tailscale lives *inside* WSL here, and ninfer's default
 is loopback-only — the one connectivity difference from vLLM's `--host 0.0.0.0` that bites
@@ -121,7 +145,7 @@ restarts nothing, printing an empty-port list + GPU memory as proof (the button 
 a heavy system job needs the whole machine).
 Cline settings against ninfer: OpenAI Compatible, base URL `http://127.0.0.1:8080/v1`,
 model `qwen3.8-27b`, context window **262,144**, max output **32,768** → **229,376 usable
-prompt, 2.5x the vLLM setup's 90,112**. Full walk-through in `CLINE-NINFER.md`.
+prompt, 2.5x the vLLM setup's 90,112**. Full walk-through in `docs/CLINE-NINFER.md`.
 
 xhigh finally has room: the Qwen card's official reasoning budget is 262,144, and our
 measured natural stops run 15K to beyond 48K — impossible inside a 104K window, trivial
@@ -171,7 +195,7 @@ Desktop via wsl.exe) that lets Claude orchestrate and delegate bounded tasks to 
 Qwen at xhigh -- submit/poll design so MCP client timeouts can never fire, size pre-checks,
 cached_tokens usage reporting, and a fast sync lane for quick questions. Validated end-to-end
 (handshake, live ask, background job lifecycle). Setup and the delegation playbook are in
-[QWEN-MCP-SETUP.md](QWEN-MCP-SETUP.md).
+[docs/QWEN-MCP-SETUP.md](docs/QWEN-MCP-SETUP.md).
 
 ### Residency-N: two conversations resident at once (validated, adopted)
 
@@ -193,17 +217,18 @@ Live validation on the patched binary (full battery, then production restored):
 JSONL forensics confirm both conversations reusing their full prior context from turn 2
 onward, alternating request-by-request. Design, alternatives considered (vLLM-style per-block
 state snapshots rejected — hybrid-GDN physics), and the validation plan live in
-`RESIDENCY-DESIGN.md`.
+`docs/RESIDENCY-DESIGN.md`.
 
 What keeps vLLM installed: **logprobs** (verifier / best-of-N tooling requires them; ninfer
 returns none), video-capable fallback, and ecosystem maturity. After cutover it boots
 on-demand for those jobs exactly the way ninfer used to boot for FAST.
 
-Reproduce any of it: `toolab.py`, `needleprobe.py`, `clinesim.py` (sequential + interleaved
-TTFT), `conc2big.py` (admission), `endure.py` (`CTX_SIZES` env), `cachehit-eval.py`,
-`vidprobe.py` + `genvid2.py` (large-font clip), `vision-probe.py`, `phase2.sh` /
-`phase2b.sh` / `phase2c.sh` / `phase2d.sh` (the exact batteries), `nfix_patch.py` +
-`nfix2_patch.py` (the parser fixes as applied). All honor `TARGET_URL`/`QWEN_URL`/`EVAL_URL`.
+Reproduce any of it (harnesses in `bench/`, patchers in `patches/`, the exact Phase-2/3
+batteries in `archive/`): `toolab.py`, `needleprobe.py`, `clinesim.py` (sequential +
+interleaved TTFT), `conc2big.py` (admission), `endure.py` (`CTX_SIZES` env),
+`cachehit-eval.py`, `vidprobe.py` + `genvid2.py` (large-font clip), `vision-probe.py`,
+`phase2.sh`–`phase2d.sh`, `nfix_patch.py` + `nfix2_patch.py` (the parser fixes as applied).
+All honor `TARGET_URL`/`QWEN_URL`/`EVAL_URL`.
 
 ### Upstream watch (2026-08-27): the host-KV rearchitecture
 
@@ -252,9 +277,10 @@ first verdict:
 
 Everything in this section was executed and verified on this machine — commands are literal,
 expected outputs are stated, and each step has a gate. Follow it top to bottom and there is
-nothing left to guess. Paths assume this repo lives at `C:\Users\StevenPC\Downloads\qwen38`
-(WSL view: `/mnt/c/Users/StevenPC/Downloads/qwen38`) and ninfer lives in `/opt/ninfer` inside
-WSL — adjust both consistently if yours differ.
+nothing left to guess. Paths assume the flat **working folder** is
+`C:\Users\StevenPC\Downloads\qwen38` (WSL view: `/mnt/c/Users/StevenPC/Downloads/qwen38`)
+and ninfer lives in `/opt/ninfer` inside WSL — adjust both consistently if yours differ.
+Step 0 turns a clone of this repo into that working folder.
 
 ### Requirements (verified)
 
@@ -265,6 +291,17 @@ WSL — adjust both consistently if yours differ.
 - ~25 GB free under `/opt` — the model artifact alone is 21.5 GB
 
 ### Step by step
+
+**0. Lay out the working folder.** The kit runs flat — launchers expect their companions
+beside them and at the fixed `$W` path (the repo's folders are for browsing; see
+[Repository layout](#repository-layout)). Clone anywhere, then copy the kit folders'
+*contents* — not the folders — into the working folder:
+
+    git clone https://github.com/steven5210/qwen38-27b-rtx5090.git
+    cd qwen38-27b-rtx5090
+    powershell -Command "$w='C:\Users\StevenPC\Downloads\qwen38'; New-Item -ItemType Directory -Force $w | Out-Null; Get-ChildItem ninfer,monitor,mcp,cli,vllm,patches,bench -File | Copy-Item -Destination $w"
+
+Gate: `START-NINFER.bat` and `ninfer-prod.conf` exist at the working folder's top level.
 
 **1. Clone and pin.** The four patches below are validated against upstream commit `feaf4dd`;
 newer master usually works, but the patchers are assert-guarded — on anchor drift they refuse
@@ -335,13 +372,15 @@ ninfer defaults to loopback-only. Then, in order:
 **8. Point Cline at it** — settings below. **9. Rollback** any time: `STOP-NINFER.bat`
 (stops ninfer, boots the vLLM stack, waits for health 200).
 
-**Updating an existing install.** If you cloned this repo as your working folder, `git pull`
-refreshes docs, kit scripts, harnesses, and patchers — but never the engine itself. When a
-pull brings a new `nfixN_patch.py`, apply it and rebuild: run `python3 $W/nfixN_patch.py`,
-rerun step 3's `cmake --build` + unit gates, and the next START-NINFER boots the new binary
-(the running server keeps the old one until then). Patchers are idempotent and assert-guarded,
-so rerunning the full set after a pull is always safe. The model artifact, `api-key.txt`, and
-`/opt/ninfer` are deliberately not in git — they never update via pull.
+**Updating an existing install.** Keep the clone. After `git pull`, re-run the step-0 copy —
+it refreshes docs, kit scripts, harnesses, and patchers in the working folder but never the
+engine itself (your `api-key.txt`, logs, and any local scratch are untouched: the copy only
+overwrites kit files by name). When a pull brings a new `patches/nfixN_patch.py`, apply it
+and rebuild: run `python3 $W/nfixN_patch.py`, rerun step 3's `cmake --build` + unit gates,
+and the next START-NINFER boots the new binary (the running server keeps the old one until
+then). Patchers are idempotent and assert-guarded, so rerunning the full set after a pull is
+always safe. The model artifact, `api-key.txt`, and `/opt/ninfer` are deliberately not in
+git — they never update via pull.
 
 ### Cline settings (validated optima)
 
@@ -385,6 +424,11 @@ xhigh session: 150–272 ms turn starts at ~50K context, ~138 tok/s decode.
     Paths: Windows folder C:\Users\StevenPC\Downloads\qwen38 = WSL
     /mnt/c/Users/StevenPC/Downloads/qwen38 (call it $W). Server tree: /opt/ninfer.
 
+    0. LAYOUT. If $W already contains the kit flat (START-NINFER.bat at its top level),
+       skip. Otherwise: git clone https://github.com/steven5210/qwen38-27b-rtx5090.git
+       and copy the FILES from its ninfer/, monitor/, mcp/, cli/, vllm/, patches/ and
+       bench/ folders (files only, no subfolders) into $W. Gate: $W/START-NINFER.bat
+       and $W/ninfer-prod.conf exist.
     1. PREFLIGHT. Verify and report: nvidia-smi shows RTX 5090; a CUDA toolkit >= 13.1
        exists under /usr/local/cuda-13*; cmake >= 3.28; ninja; python3; >= 25 GB free
        under /opt. Any miss -> STOP.
@@ -478,7 +522,7 @@ this on every attempt. We patched it on a fork branch (`fix/schema-typed-tool-ar
 - **Commit 4** — residency: retention-aware lane selection + LRU retained eviction. Root cause
   of "one resident conversation only" was admission tie-breaking (zero-reuse requests always
   landed on lane 0, trampling its resident), not memory. +40/-10 policy-only change; see
-  `RESIDENCY-DESIGN.md` for the full trace and field survey.
+  `docs/RESIDENCY-DESIGN.md` for the full trace and field survey.
 
 Upstream: filed as [Neroued/ninfer#66](https://github.com/Neroued/ninfer/issues/66) with the
 repro table and fix design (issue-first per their CONTRIBUTING); PR offered from the branch.
@@ -535,7 +579,7 @@ by eviction luck. That diagnosis held up almost exactly: it *was* purely a match
 change, and fix-branch commit 4 implements it (retention-aware lane selection — the pool
 already fit two conversations all along). Interleaved late-turn TTFT after the fix: **3.18s**,
 with a 50K interleaved turn indistinguishable from sequential. Details in the Residency-N
-section and `RESIDENCY-DESIGN.md`.
+section and `docs/RESIDENCY-DESIGN.md`.
 
 #### Vision & video head-to-head (and the config ceiling)
 

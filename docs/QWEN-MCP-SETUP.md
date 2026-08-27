@@ -32,7 +32,8 @@ Requirements: Tailscale running on the Mac (same tailnet), the PC on with ninfer
 and python3 present (macOS: `python3 --version`; accept the Xcode tools prompt if asked).
 
 1. Make a folder, e.g. `~/qwen-mcp/`, containing:
-   - `qwen_mcp.py` (this repo)
+   - `qwen_mcp.py` (`mcp/` in this repo — or let `mcp/mac-setup.sh` do steps 1-2 for you:
+     it downloads the file, merges the Claude config with a backup, and checks the tailnet)
    - `api-key.txt` (same one line as on the PC)
 2. Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
