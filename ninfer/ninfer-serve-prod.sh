@@ -8,6 +8,12 @@ bash $R/killall-vllm.sh >/dev/null 2>&1
 pkill -9 -x ninfer-serve 2>/dev/null; sleep 3   # -x: exact process name only (never this script)
 mkdir -p /opt/ninfer/logs
 : > /opt/ninfer/logs/prod.err
+# keep tailscale reachable (installed + authed once; safe no-op otherwise)
+if command -v tailscaled >/dev/null 2>&1; then
+  if [ "$(ps -p 1 -o comm=)" = "systemd" ]; then systemctl start tailscaled 2>/dev/null || true
+  else pgrep -x tailscaled >/dev/null || { setsid tailscaled > /var/log/tailscaled.log 2>&1 & sleep 2; }
+  fi
+fi
 echo "[ninfer] booting Qwen3.8-27B NVFP4  ctx=$CTX  int8 KV  MTP-3  conc 2  vision=${VISION:-0}"
 echo "[ninfer] endpoint http://127.0.0.1:8080/v1  (boot takes ~10 seconds)"
 exec /opt/ninfer/src/build/apps/ninfer-serve /opt/ninfer/models/qwen3_8_27b_nvfp4.ninfer \

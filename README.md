@@ -401,6 +401,12 @@ xhigh session: 150–272 ms turn starts at ~50K context, ~138 tok/s decode.
 
 ### Troubleshooting (every entry actually happened here)
 
+- **`cudaGetDeviceCount failed: cudaErrorInsufficientDriver` right after a Windows NVIDIA
+  driver update** -> the still-running WSL VM maps the *old* driver's usermode libraries.
+  Fix: `wsl --shutdown` from Windows, then START-NINFER.bat. Terminating the distro alone is
+  NOT enough (the mismatch lives at the WSL platform level; measured 2026-08-27: after the
+  616.56 update, distro terminate still failed NVML -- full shutdown fixed it). The kit's
+  boot script restarts tailscaled itself, so remote access survives the restart.
 - **NMON says READY but Cline can't connect** -> binding. Stock ninfer listens on `127.0.0.1`
   only; the kit passes `--host 0.0.0.0`. Tailscale runs *inside* WSL here, so loopback-only
   means invisible to remote clients.
