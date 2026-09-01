@@ -142,7 +142,10 @@ flicker-free alt-screen rendering, follows whichever stack is up, context bar + 
 TTFT per request, decode sparkline, idle-aware now-stats with a state line (IDLE with time-since-last-request / GENERATING with elapsed + ~tokens-so-far + a stall detector), session token totals, real process uptime, and VRAM alarms (measured paging
 thresholds on vLLM; growth-above-boot-baseline on ninfer). `STOP-ALL.bat` stops *everything* — ninfer, vLLM, stray builds — and
 restarts nothing, printing an empty-port list + GPU memory as proof (the button you want when
-a heavy system job needs the whole machine).
+a heavy system job needs the whole machine). Kills are by process *identity* -- ninfer-serve by exact
+name, vLLM as the launcher's process tree, builds only under `/opt/ninfer` -- so nothing else on
+the box (other venv users, other compiles) is touched; `bash stop-all.sh --dry-run` prints exactly
+what would die and kills nothing.
 Cline settings against ninfer: OpenAI Compatible, base URL `http://127.0.0.1:8080/v1`,
 model `qwen3.8-27b`, context window **262,144**, max output **32,768** → **229,376 usable
 prompt, 2.5x the vLLM setup's 90,112**. Full walk-through in `docs/CLINE-NINFER.md`.
