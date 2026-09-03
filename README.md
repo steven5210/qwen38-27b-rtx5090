@@ -4,7 +4,7 @@ Runs **Qwen3.8-27B (unsloth NVFP4)** two ways on a desktop RTX 5090 (SM120, 32GB
 every number in this repo measured on this machine, nothing assumed:
 
 - **Production: [ninfer](https://github.com/Neroued/ninfer)** — a from-scratch C++/CUDA engine
-  running our four-commit fix branch. **262,144-token context** (the model's native max,
+  running our five-commit fix branch. **262,144-token context** (the model's native max,
   2.5x the vLLM setup), ~10 s
   boots, live Cline turn starts of **150–565 ms** at 50–100K context, two conversations
   resident at once. Parts I–III.
@@ -127,7 +127,7 @@ so it must stay at top level).
 
 ## Part I — ninfer in production
 
-The engine this machine runs today, with the four-commit fix branch adopted and validated.
+The engine this machine runs today, with the five-commit fix branch adopted and validated.
 Boot it, point Cline at it, done.
 
 ### Running it for real: the Phase-3 kit
@@ -306,7 +306,7 @@ beside them and at the fixed `$W` path (the repo's folders are for browsing; see
 
 Gate: `START-NINFER.bat` and `ninfer-prod.conf` exist at the working folder's top level.
 
-**1. Clone and pin.** The four patches below are validated against upstream commit `feaf4dd`;
+**1. Clone and pin.** The five patches below are validated against upstream commit `feaf4dd`;
 newer master usually works, but the patchers are assert-guarded — on anchor drift they refuse
 loudly instead of mis-patching.
 
@@ -324,6 +324,7 @@ lands upstream — without them, string-declared tool arguments containing JSON 
     python3 $W/nfix2_patch.py    # vLLM-parity scalar coercion  -> NFIX2_PATCH_OK
     python3 $W/nfix3_patch.py    # cached_tokens usage telemetry -> NFIX3_PATCH_OK
     python3 $W/nfix4_patch.py    # residency-N lane selection    -> NFIX4_PATCH_OK
+    python3 $W/nfix5_patch.py    # tool results as content-part arrays -> NFIX5_PATCH_OK
 
 Each exits 0 and prints progress; rerunning prints "already patched" and changes nothing.
 An `AssertionError` means upstream drifted — stop and reconcile, never hand-edit around it.
@@ -445,7 +446,7 @@ xhigh session: 150–272 ms turn starts at ~50K context, ~138 tok/s decode.
        cd /opt/ninfer/src && git checkout feaf4dd.
     3. PATCH. Run in order: python3 $W/nfix_patch.py ; python3 $W/nfix_test.py ;
        python3 $W/nfix2_patch.py ; python3 $W/nfix3_patch.py ;
-       python3 $W/nfix4_patch.py. Gate: every one exits 0
+       python3 $W/nfix4_patch.py ; python3 $W/nfix5_patch.py. Gate: every one exits 0
        (progress lines, or "already patched"). An AssertionError -> STOP (upstream drift).
     4. BUILD. cmake -S /opt/ninfer/src -B /opt/ninfer/src/build -G Ninja
        -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON

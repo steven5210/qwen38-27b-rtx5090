@@ -45,6 +45,7 @@ if [ "$DRY" = 1 ]; then echo "dry-run: nothing killed"; exit 0; fi
 echo "killed=$killed"
 sleep 4
 LEFT=$(pgrep -cf "^VLLM::|^($VENV/python[0-9.]* )?$VENV/vllm( |\$)" 2>/dev/null); echo "procs_left=${LEFT:-0}"
+if [ "$killed" = 0 ] && [ "${LEFT:-0}" = 0 ]; then echo "no vLLM was running; skipping VRAM wait"; exit 0; fi
 for i in $(seq 1 24); do
   USED=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' ')
   if [ "${USED:-99999}" -lt 3000 ]; then echo "gpu_released=${USED}MiB"; break; fi
