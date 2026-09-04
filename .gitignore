@@ -4,3 +4,5 @@ logs/
 *.bak
 _to_delete_*
 __pycache__/
+# Local MCP records and ownership/generation locks
+mcp/jobs/

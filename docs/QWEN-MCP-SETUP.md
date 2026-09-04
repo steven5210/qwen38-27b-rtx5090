@@ -1,8 +1,15 @@
 # Delegating Claude work to local Qwen3.8-27B (MCP setup)
 
-One local MCP server (`qwen_mcp.py`) gives Claude Desktop -- chats AND Cowork sessions
-(local MCP servers are proxied into Cowork automatically) -- five tools for delegating
-work to the ninfer server on this machine. Validated end-to-end on 2026-08-20.
+`qwen_mcp.py` gives Claude Desktop five tools for delegating text tasks to NINFER.
+**Current bridge: v1.3.0 (2026-09-04).** It uses only Python's standard library on
+macOS or Linux/WSL; native Windows Python is not supported because coordination uses
+POSIX file locks. The original live workflow was validated on 2026-08-20; all 20
+v1.3.0 regression tests passed on macOS and WSL with a fake inference server.
+
+Claude can start more than one MCP process. Processes using the same local `jobs/`
+directory share job status/results and serialize their generation requests. The bridge
+returns text; **Qwen Code is a separate Mac client that executes tools in its worktree**.
+Neither that client's jobs nor another machine's MCP registry are managed by this bridge.
 
 ## Install (one time, ~2 minutes)
 
@@ -21,7 +28,9 @@ work to the ninfer server on this machine. Validated end-to-end on 2026-08-20.
 
 3. Fully quit Claude Desktop (system tray -> Quit) and reopen it.
 4. Check: the tools icon in a new chat should list qwen_health / qwen_ask / qwen_submit /
-   qwen_status / qwen_result. Say "run qwen_health" -- expect UP + window 262,144.
+   qwen_status / qwen_result. Say "run qwen_health" -- expect UP, **v1.3.0**, and the
+   configured 262,144-token window. Older NINFER builds do not advertise their window;
+   the health response labels the configured fallback explicitly.
 
 Why wsl.exe: the server runs inside WSL where 127.0.0.1:8080 is guaranteed reachable
 (same path every probe in this repo used). No Windows Python, no pip installs.
@@ -47,9 +56,37 @@ and python3 present (macOS: `python3 --version`; accept the Xcode tools prompt i
       }
     }
 
-3. Fully quit Claude Desktop (Cmd+Q) and reopen. "run qwen_health" should say UP.
+3. Fully quit Claude Desktop (Cmd+Q) and reopen. "run qwen_health" should say UP and v1.3.0.
 
-Same server, same jobs, from the couch. Latency adds only the tailnet round-trip.
+The Mac reaches the same inference server over the tailnet. Its jobs live in
+`~/qwen-mcp/jobs`; they are shared by MCP processes on that Mac, not with the PC's registry.
+If Claude cannot resolve `python3`, use the absolute path returned by `command -v python3`
+in the `command` field (for example `/opt/homebrew/bin/python3`).
+
+## Updating an existing installation
+
+Updating the bridge does **not** require a NINFER restart or a change to the Claude MCP
+registration. Install the new script, then reload it on the next full Claude restart.
+
+1. Pull this repository and optionally run `python3 -B mcp/test_bridge.py` from its root.
+   The suite uses temporary records and fake HTTP responses, so NINFER may keep running.
+2. Back up the deployed `qwen_mcp.py`. Keep `api-key.txt` and the `jobs/` directory.
+3. Replace the script at the path already registered in Claude. To avoid a partially
+   written script, copy to a temporary file in the destination directory, check its syntax,
+   then rename it over `qwen_mcp.py`. Existing processes continue with their loaded code.
+4. When current jobs finish, fully quit Claude (Cmd+Q on Mac; system tray -> Quit on
+   Windows), then reopen it. Merely closing its window may leave MCP processes running.
+5. Call `qwen_health` and confirm **v1.3.0**. A v1.2.0 response means an old process is
+   still serving that session.
+
+Completed v1.2 results remain readable. A job interrupted by a restart is reported as
+failed/incomplete on lookup; it is **not automatically resumed or resubmitted**. Partial
+answer snapshots may be available, but their presence does not mean the task finished.
+Avoid mixing old and new live bridge processes: v1.2 does not participate in the new locks.
+
+This update preserves **xhigh**, the **131,072-token output ceiling**, and the
+**262,144-token context setting**. `QWEN_MCP_JOBS` is no longer used to raise concurrency;
+v1.3.0 intentionally permits one generation per shared local registry.
 
 ## Daily workflow
 
@@ -65,11 +102,15 @@ Same server, same jobs, from the couch. Latency adds only the tailnet round-trip
    >
    > QWEN OPERATING PARAMETERS (fixed -- do not deviate): server window 262,144 tokens.
    > Every qwen_submit runs at reasoning_effort xhigh with max_tokens 131,072 (thinking and
-   > answer share it) -- never lower the effort or output budget. That leaves exactly
-   > 131,072 tokens of prompt budget for task + context + system; size specs to fit
-   > (qwen_submit pre-checks and rejects oversized). qwen_ask (effort none/low) is the only
+   > answer share it) -- never lower the effort or output budget. That leaves a nominal
+   > 131,072 tokens for the rendered prompt, including task, context, system and template
+   > overhead. Leave margin: qwen_submit's character-based pre-check is approximate.
+   > qwen_ask (effort none/low) is the only
    > sub-xhigh lane. Use qwen_status with wait:true instead of polling (chain sub-50s
    > waits for long jobs) and context_path for large file contexts.
+   > If qwen_ask returns a job ID, follow that job instead of asking again. Only state
+   > done is a completed result; incomplete/error and isError:true require inspection.
+   > Run one large xhigh job at a time. Direct Qwen Code calls do not share the MCP lock.
    >
    > ROUTING -- for each subtask pick the CHEAPEST tier that delivers FULL quality (the
    > bar is identical at every tier; when in doubt between tiers, route UP):
@@ -108,30 +149,54 @@ Same server, same jobs, from the couch. Latency adds only the tailnet round-trip
 
 | tool | what | latency |
 |---|---|---|
-| qwen_health | up/down, model, window, running jobs | instant |
-| qwen_ask | sync question, effort none/low, <=4K out | seconds |
+| qwen_health | engine readiness, authenticated model lookup, window source, bridge version, shared local job states | short HTTP checks |
+| qwen_ask | effort none/low, <=4K out; shares the queue; returns an answer or a job ID to follow | waits up to 45s |
 | qwen_submit | background job, default **effort xhigh, max_tokens 131,072**; `context_path` reads a local file (<=2MB) so huge contexts never go through tool parameters | returns instantly |
-| qwen_status | snapshot -- or `wait:true` BLOCKS until done/error (default 45s, hard-clamped 50s; CHAIN calls for multi-minute jobs; clean still-running at the clamp; wakes ~instantly on completion; other tools not blocked) | instant / blocking |
-| qwen_result | answer + usage (incl. cached_tokens); thinking omitted | instant |
+| qwen_status | shared snapshot, or `wait:true` until done/error/incomplete (default 45s, capped at 50s); chain calls for long jobs; queued/running at the wait boundary is normal | snapshot / bounded wait |
+| qwen_result | answer + usage (incl. cached_tokens); failed/incomplete jobs return an error with available partial answer text; thinking text omitted | snapshot |
 
-## Timeouts and other gotchas (designed around)
+## Reading results and handling interruptions
 
-- **Why waits are clamped to 50s (v1.2)**: the MCP harness KILLS the whole server process
-  when a tool call blocks past ~60s -- that kill, not the wait, wiped the v1.1 job registry
-  and lost a running job. v1.2 hard-clamps every wait below the threshold and persists the
-  registry to <dir>/jobs/: finished results survive restarts, and a job in flight during a
-  kill returns clearly marked "lost:" instead of unknown. Chain wait calls for long jobs.
-- **Payload limit**: 2,000,000 bytes per submit (MCP pre-check with the size named in the
-  error; server pinned to --max-request-mib 2). Use context_path for big files.
-- **Server down**: tools return a clear message telling Claude to have you run
-  START-NINFER.bat. Nothing hangs.
-- **Prompt budget**: at max_tokens=131,072 the prompt may be ~121K tokens; qwen_submit
-  pre-checks size and REJECTS oversized specs with the numbers instead of erroring late.
-- **Jobs live in the MCP process** (in memory): quitting Claude Desktop mid-job loses the
-  job (the server finishes generating; the result is just unclaimed). Fetch results
-  before quitting.
-- **Concurrency**: 1 delegation job at a time by default (QWEN_MCP_JOBS env to raise;
-  server lanes = 2) so a live Cline session keeps its resident cache. Two big xhigh
-  jobs + active Cline can evict a resident under page pressure (LRU) -> one re-prefill.
-- **Effort**: xhigh default per the validated lane (thinking 15-48K+ tokens, minutes of
-  wall time). Drop to medium in the submit call for faster bounded tasks.
+| Job state | Meaning | Next step |
+|---|---|---|
+| `queued` / `running` | Work is waiting or active | Continue `qwen_status` waits; do not resubmit |
+| `done` | Stream ended with a valid stop reason and `[DONE]` | Fetch and validate the answer |
+| `incomplete` | Output was truncated, interrupted after partial output, or contained unsupported tool output | Inspect error and partial answer; decide deliberately whether to resubmit |
+| `error` | Request failed or the owning process exited before a recoverable answer | Inspect the error and underlying connection/service before retrying |
+
+Failed/incomplete status and result calls carry MCP **`isError: true`**. An empty EOF,
+malformed SSE frame or server error frame is never treated as success. An output limit
+(`finish_reason: length`) is incomplete even when some answer text is present. The bridge
+does not execute tool calls, retry work automatically, or certify generated code as correct.
+
+## Limits and operation
+
+- **Waits:** status waits are capped at 50 seconds to leave margin below the harness
+  timeout seen in earlier versions. Quick asks use the same durable job mechanism and
+  return the job ID after 45 seconds if necessary. A wait ending is not a job timeout.
+- **Retention:** the newest 50 terminal results are kept by completion time, plus every
+  queued/running record. Cleanup happens when a worker persists a terminal result.
+  Results outside retention may report an expired/unknown ID.
+- **Restart recovery:** ownership file locks distinguish a live job in another MCP
+  process from an interrupted job. The OS releases a terminated owner's lock. Recovery
+  occurs when job records are read; partial answer snapshots are saved periodically as
+  output arrives. In-flight generation itself does not survive a process exit.
+- **Concurrency:** all processes using the same local `jobs/` directory share one
+  generation slot, including quick asks. Do not use a network share for the registry.
+  NINFER still has two lanes, but two large xhigh requests may not fit together. Direct
+  Qwen Code/Cline calls and MCPs on other machines are outside this local lock.
+- **Payload:** the bridge caps the encoded JSON request at 2,000,000 bytes; the server's
+  `--max-request-mib 2` allows 2,097,152 bytes. `context_path` avoids large tool arguments,
+  but its contents still count toward the HTTP body and context limits.
+- **Context:** preflight uses a character-based estimate, not exact tokenization. Keep
+  margin for templates and tokenization differences. Health reports the server's window
+  when available, otherwise it labels the 262,144 configured fallback. The submit budget
+  remains configured at 262,144; a future server context change must be coordinated here.
+- **Model profile:** xhigh and the 131,072 output ceiling remain the current delegation
+  policy. The bridge still exposes effort/output fields for explicitly selected jobs;
+  do not automatically reduce them to make a second large request fit.
+
+See [MCP reliability implementation and tests](MCP-RELIABILITY.md) for the change list,
+test command and the optional live smoke check. NINFER upgrades and VRAM/KV tuning are
+separate work: production remains pinned pending workload validation, with no automatic
+changes to inference capacity or reasoning budgets.

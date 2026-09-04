@@ -1,37 +1,100 @@
 #!/usr/bin/env python3
-"""Drive qwen_mcp.py over stdio exactly like Claude Desktop would."""
-import json, subprocess, sys, time
-P = subprocess.Popen(["python3", "-u", "/mnt/c/Users/StevenPC/Downloads/qwen38/qwen_mcp.py"],
-                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
-def send(m): P.stdin.write(json.dumps(m) + "\n"); P.stdin.flush()
-def recv(timeout=95):
-    import select
-    r, _, _ = select.select([P.stdout], [], [], timeout)
-    return json.loads(P.stdout.readline()) if r else {"TIMEOUT": True}
-def call(i, name, args):
-    send({"jsonrpc": "2.0", "id": i, "method": "tools/call",
-          "params": {"name": name, "arguments": args}})
-    r = recv()
-    txt = r.get("result", {}).get("content", [{}])[0].get("text", r)
-    print("== %s ->" % name, str(txt)[:300].replace("\n", " | "))
-    return txt
+"""Optional live stdio smoke check; sends short requests to the configured NINFER.
 
-send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-      "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}})
-print("== initialize ->", json.dumps(recv())[:160])
-send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-print("== tools/list ->", [t["name"] for t in recv()["result"]["tools"]])
-call(3, "qwen_health", {})
-call(4, "qwen_ask", {"question": "Reply with exactly: DELEGATION-OK", "effort": "none"})
-sub = call(5, "qwen_submit", {"task": "Write a python one-liner that reverses a string. Reply with just the code.",
-                              "effort": "low", "max_tokens": 2048})
-jid = sub.split("Job ")[1].split(" ")[0] if "Job " in sub else None
-print("== job id:", jid)
-for _ in range(20):
-    time.sleep(3)
-    st = call(6, "qwen_status", {"job_id": jid})
-    if '"done"' in st or '"error"' in st: break
-call(7, "qwen_result", {"job_id": jid})
-P.terminate()
-print("MCPTEST_DONE")
+Use test_bridge.py for isolated regression tests without production inference.
+Pass the deployed qwen_mcp.py path so its adjacent api-key.txt is available.
+"""
+import argparse
+import json
+from pathlib import Path
+import re
+import select
+import subprocess
+import sys
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("bridge", nargs="?", type=Path,
+                        default=Path(__file__).with_name("qwen_mcp.py"))
+    args = parser.parse_args()
+    process = subprocess.Popen([sys.executable, "-u", "-B", str(args.bridge.resolve())],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               text=True, bufsize=1)
+    request_id = 0
+
+    def rpc(method, params=None):
+        nonlocal request_id
+        request_id += 1
+        process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id,
+                                       "method": method, "params": params or {}}) + "\n")
+        process.stdin.flush()
+        if not select.select([process.stdout], [], [], 55)[0]:
+            raise RuntimeError("MCP response timeout for " + method)
+        line = process.stdout.readline()
+        if not line:
+            raise RuntimeError("MCP process exited before replying")
+        response = json.loads(line)
+        if response.get("id") != request_id or "error" in response:
+            raise RuntimeError("MCP protocol error: " + json.dumps(response))
+        return response["result"]
+
+    def call(name, arguments=None):
+        result = rpc("tools/call", {"name": name, "arguments": arguments or {}})
+        text = "\n".join(part.get("text", "") for part in result.get("content", [])
+                         if part.get("type") == "text")
+        print("== %s -> %s" % (name, text[:300].replace("\n", " | ")))
+        if result.get("isError"):
+            raise RuntimeError(name + " failed: " + text)
+        return text
+
+    def finish_job(jid):
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            status = json.loads(call("qwen_status", {
+                "job_id": jid, "wait": True,
+                "timeout_s": min(45, max(0, deadline - time.monotonic()))}))
+            if status["state"] == "done":
+                return call("qwen_result", {"job_id": jid})
+            if status["state"] not in ("queued", "running"):
+                raise RuntimeError("Job did not complete: " + json.dumps(status))
+        raise RuntimeError("Job %s did not finish within 300 seconds" % jid)
+
+    try:
+        initialized = rpc("initialize", {"protocolVersion": "2025-06-18",
+                          "capabilities": {}, "clientInfo": {"name": "qwen-live-smoke", "version": "1"}})
+        print("== initialize ->", json.dumps(initialized))
+        process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        process.stdin.flush()
+        names = {tool["name"] for tool in rpc("tools/list")["tools"]}
+        expected = {"qwen_health", "qwen_ask", "qwen_submit", "qwen_status", "qwen_result"}
+        if not expected.issubset(names):
+            raise RuntimeError("Required tools missing: " + str(expected - names))
+        call("qwen_health")
+        quick = call("qwen_ask", {"question": "Reply with exactly: DELEGATION-OK", "effort": "none"})
+        pending = re.match(r"Job ([0-9a-f]+) is still (?:queued|running)", quick)
+        if pending:
+            quick = finish_job(pending.group(1))
+        if "DELEGATION-OK" not in quick:
+            raise RuntimeError("Quick response did not contain the requested marker")
+        submitted = call("qwen_submit", {
+            "task": "Write a Python one-liner that reverses a string. Reply with just the code.",
+            "effort": "low", "max_tokens": 2048})
+        match = re.match(r"Job ([0-9a-f]+) submitted", submitted)
+        if not match:
+            raise RuntimeError("Submission did not return a job ID")
+        finish_job(match.group(1))
+        print("MCPTEST_DONE")
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+
+
+if __name__ == "__main__":
+    main()

@@ -23,6 +23,7 @@ makes a server *silently* 27x slower after a few minutes of use, with no error a
   - [Running it for real: the Phase-3 kit](#running-it-for-real-the-phase-3-kit)
   - [Cline settings on ninfer — both profiles](#cline-settings-on-ninfer--both-profiles)
   - [Remote access (optional)](#remote-access-optional)
+  - [Delegating Claude work to local Qwen (MCP)](#delegating-claude-work-to-local-qwen-mcp)
   - [First live Cline session on ninfer (xhigh) — measured minutes in](#first-live-cline-session-on-ninfer-xhigh--measured-minutes-in)
   - [Residency-N: two conversations resident at once (validated, adopted)](#residency-n-two-conversations-resident-at-once-validated-adopted)
 - [Part II — Setting up ninfer from scratch (humans and AI agents)](#part-ii--setting-up-ninfer-from-scratch-humans-and-ai-agents)
@@ -93,8 +94,10 @@ Engine off (WE-tolerant fallbacks: 252,928 / 152,576). vLLM fallback client sett
 
 1. **Desktop VRAM over ~1.3GB** → Windows pages GPU memory, 10x slowdown, no error. Close
    Wallpaper Engine. (Both stacks.)
-2. **Reasoning effort left unset** → the chat template defaults to `xhigh`, which scored
-   **9/24 vs medium's 24/24** for agent coding here. [Details](#do-not-use-reasoning_effort-xhigh-for-agent-coding). (Both stacks.)
+2. **Reasoning effort and output budget must match the workload.** Current Claude/Qwen Code
+   delegation uses **xhigh with 131,072 maximum output tokens** and a 262,144-token window.
+   The historical medium-vs-xhigh results below describe the earlier constrained vLLM
+   workload; they are not an instruction to lower the current delegation profile.
 3. **`VISION=1` with `CTX` at 192,512+ on ninfer** → boots fine, then prefill runs 7-11x
    slower. The measured vision ceiling is **172,032**; use the profile pair as written.
 4. **Raising `--max-num-batched-tokens` on vLLM** → looks like a prefill optimization,
@@ -112,12 +115,12 @@ pulling updates. Setting up fresh? Step 0 of Part II flattens the kit for you.
 |---|---|
 | `ninfer/` | The production kit: `START-NINFER.bat` / `STOP-NINFER.bat` / `STOP-ALL.bat`, `ninfer-prod.conf`, the boot/stop scripts |
 | `monitor/` | QMON, the unified flicker-free dashboard (`qmon.py` + its three launcher aliases) |
-| `mcp/` | `qwen_mcp.py` (the Claude delegation MCP server), `mac-setup.sh` (Mac installer), `mcptest.py` (stdio harness) |
+| `mcp/` | `qwen_mcp.py` (v1.3.0 Claude delegation bridge), `mac-setup.sh` (Mac installer), `test_bridge.py` (isolated regression suite), `mcptest.py` (optional live stdio check) |
 | `cli/` | One-off ask launchers: the `QWEN-ASK.bat` menu, ASK-XHIGH / ASK-MEDIUM / ASK-FAST, `ask-xhigh.py` |
 | `vllm/` | The fallback stack: `SETUP.bat` + provisioning, `serve-wsl.sh`, its profile launchers, `killall-vllm.sh` |
-| `patches/` | The four assert-guarded ninfer patchers (`nfix*_patch.py`) and the residency worktree scripts |
+| `patches/` | The five assert-guarded ninfer patchers (`nfix*_patch.py`) and the residency worktree scripts |
 | `bench/` | Every harness behind the numbers in this README: `codeeval.py`, `toolab.py`, `needleprobe.py`, `cachehit-eval.py`, `clinesim.py`, the probes |
-| `docs/` | `QWEN-MCP-SETUP.md` (delegation playbook), `CLINE-NINFER.md`, `RESIDENCY-DESIGN.md`, the upstream issue draft |
+| `docs/` | `QWEN-MCP-SETUP.md` (delegation playbook), `MCP-RELIABILITY.md` (v1.3.0 behavior and checks), `CLINE-NINFER.md`, `RESIDENCY-DESIGN.md`, the upstream issue draft |
 | `archive/` | Superseded but real: old monitors, the retired 5am maintenance task, the one-off Phase-2/3 batteries — [why each is here](archive/README.md) |
 
 Root keeps this README and `PUSH-TO-GITHUB.bat` (it publishes whatever folder it sits in,
@@ -193,12 +196,35 @@ auth is always on. Nothing is exposed to the LAN or the internet.
 
 ### Delegating Claude work to local Qwen (MCP)
 
-`qwen_mcp.py` + `QWEN-MCP-SETUP.md`: a zero-dependency local MCP server (launched by Claude
-Desktop via wsl.exe) that lets Claude orchestrate and delegate bounded tasks to this machine's
-Qwen at xhigh -- submit/poll design so MCP client timeouts can never fire, size pre-checks,
-cached_tokens usage reporting, and a fast sync lane for quick questions. Validated end-to-end
-(handshake, live ask, background job lifecycle). Setup and the delegation playbook are in
-[docs/QWEN-MCP-SETUP.md](docs/QWEN-MCP-SETUP.md).
+**MCP v1.3.0** runs on macOS or Linux/WSL using only Python's standard library. Claude
+delegates text tasks through five tools, with **xhigh / 131,072 output tokens / 262,144
+context** retained for the main delegation profile. Qwen Code separately runs the coding
+agent and executes tools in Mac worktrees; this MCP bridge does not launch Qwen Code.
+
+The September 4 reliability update fixes incomplete streams being reported as successful,
+shares job state across MCP processes using the same local `jobs/` directory, and retains
+the newest **50 terminal results by completion time**, preserving queued/running jobs.
+One MCP generation runs at a time across those processes. NINFER's two lanes do not mean
+two large xhigh jobs fit concurrently; direct Qwen Code requests are outside the MCP lock.
+
+`qwen_ask` shares that queue and returns its job ID if it has not finished within 45 seconds.
+`qwen_status` supports bounded waits of up to 50 seconds. Failed/incomplete results carry
+MCP `isError: true`, with partial output available for inspection instead of silent success.
+
+Replacing the script does not restart its existing processes or NINFER. After current work
+finishes, fully quit Claude (**Cmd+Q on Mac**) and reopen it; `qwen_health` should report
+**v1.3.0**. Completed v1.2 results remain readable; in-flight work is not resumed automatically.
+
+The **20 regression tests passed on macOS and WSL** using temporary records and a fake HTTP
+server, without loading a model or disturbing production inference. Run from the repo root:
+
+```bash
+python3 -B mcp/test_bridge.py
+```
+
+See [setup and upgrade instructions](docs/QWEN-MCP-SETUP.md) and
+[reliability behavior and verification](docs/MCP-RELIABILITY.md). The NINFER build,
+reasoning/output budgets and VRAM profile remain pinned; this is a client-bridge update.
 
 ### Residency-N: two conversations resident at once (validated, adopted)
 
@@ -260,8 +286,9 @@ first verdict:
 
 - **Concurrency 2 does not cost context.** The KV pool is shared, not split per lane — a
   single request can hold ~the whole pool (the 236K needle passed at conc 2). Lane 2 costs
-  megabytes of workspace and buys residency-2 plus Cline-parallel MCP delegation. Refuted
-  for good.
+  megabytes of workspace and retains a second conversation. Concurrent execution still
+  depends on the combined context/output requirements; the current large xhigh workload
+  is operated one job at a time.
 - **262,144 (the model's native max) first measured as a collapse — decode 20.7 tok/s —
   then fully exonerated.** The killer was Wallpaper Engine *actively compositing*: with
   `wallpaper64.exe` terminated (even with ~1.5 GB of other desktop apps still resident),

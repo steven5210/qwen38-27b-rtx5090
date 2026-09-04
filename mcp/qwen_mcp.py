@@ -1,76 +1,205 @@
 #!/usr/bin/env python3
-"""qwen_mcp.py -- local MCP server that lets Claude delegate work to the Qwen3.8-27B
-ninfer server on this machine. Zero dependencies; runs inside WSL on the PC (launched by
-Claude Desktop via wsl.exe) or natively on macOS (python3), reaching the server over
-loopback or Tailscale via QWEN_URL.
+"""Qwen local MCP 1.3.0, for macOS and Linux/WSL (Python standard library only).
 
-Tools:
-  qwen_health()                     -- is the server up, which model/window
-  qwen_ask(question, effort=low)    -- synchronous quick lane (keep under ~45s: none/low)
-  qwen_submit(task, context?, context_path?, ...) -- start a big job (default effort xhigh)
-  qwen_status(job_id, wait?, timeout_s?) -- snapshot, or BLOCK until done/error/timeout
-  qwen_result(job_id)               -- the answer (+usage; thinking omitted by default)
+Jobs share durable JSON records, crash-released ownership leases and one generation
+lock across MCP processes using the same jobs directory. Direct Qwen Code clients
+are scheduled by NINFER separately. Existing completed v1.2 records remain readable.
+No model, reasoning-effort, output-budget or inference-server settings are changed.
+"""
+import contextlib
+import fcntl
+import json
+import math
+import os
+import re
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
 
-v1.1.0: wait/timeout_s on qwen_status (completion push); context_path on qwen_submit;
-2MB payload cap; worker-threaded tool calls.
-v1.2.0: waits are clamped to 50s max -- the MCP harness kills the whole server process on
-long-blocked tool calls, and that kill (not the wait itself) is what wiped the v1.1 job
-registry; chained sub-50s waits are the intended pattern for multi-minute jobs. The job
-registry now persists to <dir>/jobs/: finished results survive an MCP restart, and jobs
-that were in flight during a kill come back honestly marked lost instead of unknown."""
-import json, os, sys, threading, time, urllib.request, urllib.error, uuid
-
-BASE = os.environ.get("QWEN_URL", "http://127.0.0.1:8080")
+VERSION = "1.3.0"
+BASE = os.environ.get("QWEN_URL", "http://127.0.0.1:8080").rstrip("/")
 D = os.path.dirname(os.path.abspath(__file__))
-try: KEY = open(os.path.join(D, "api-key.txt")).read().strip()
-except Exception: KEY = ""
+try:
+    with open(os.path.join(D, "api-key.txt")) as f:
+        KEY = f.read().strip()
+except OSError:
+    KEY = ""
 WINDOW = 262_144
 MAX_SYNC_TOKENS = 4096
-MAX_PAYLOAD_BYTES = 2_000_000   # hard cap on one submit's JSON body (server: --max-request-mib 2)
+MAX_PAYLOAD_BYTES = 2_000_000
 WAIT_DEFAULT_S = 45.0
-WAIT_MAX_S = 50.0   # below the MCP harness's tool-call kill threshold (~60s)
-JOBS = {}
-LOCK = threading.Lock()
-OUT_LOCK = threading.Lock()
-ACTIVE = threading.Semaphore(int(os.environ.get("QWEN_MCP_JOBS", "1")))  # be gentle to live Cline sessions
+WAIT_MAX_S = 50.0
+POLL_S = 0.2
+SNAPSHOT_S = 1.0
+KEEP_RESULTS = 50
+LIVE_STATES = ("queued", "running")
+TERMINAL_STATES = ("done", "error", "incomplete", "cancelled")
 JOBS_DIR = os.path.join(D, "jobs")
-PERSIST_KEYS = ("state", "started", "ended", "phase", "task_preview", "answer",
-                "thinking_chars", "usage", "error", "finish", "effort")
+REGISTRY_LOCK = threading.RLock()
+OUT_LOCK = threading.Lock()
+ACTIVE = threading.Semaphore(1)
+OWNER = uuid.uuid4().hex
+OWNERS = {}
 
-def persist(jid):
-    try:
+
+class ToolError(Exception):
+    """A user-visible failed or incomplete operation, including any partial output."""
+
+
+@contextlib.contextmanager
+def registry():
+    # Separate opens alone do not replace a thread lock on every supported OS.
+    with REGISTRY_LOCK:
         os.makedirs(JOBS_DIR, exist_ok=True)
-        j = JOBS[jid]
-        rec = {k: j.get(k) for k in PERSIST_KEYS}
-        tmp = os.path.join(JOBS_DIR, jid + ".tmp")
-        with open(tmp, "w") as f: json.dump(rec, f)
-        os.replace(tmp, os.path.join(JOBS_DIR, jid + ".json"))
-        files = sorted(f for f in os.listdir(JOBS_DIR) if f.endswith(".json"))
-        for old in files[:-50]:
-            try: os.remove(os.path.join(JOBS_DIR, old))
-            except Exception: pass
-    except Exception:
-        pass   # persistence is best-effort; never fail a tool call over it
+        with open(os.path.join(JOBS_DIR, ".registry.lock"), "a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
-def load_persisted():
-    try: files = os.listdir(JOBS_DIR)
-    except Exception: return
-    for fn in files:
-        if not fn.endswith(".json"): continue
-        jid = fn[:-5]
-        try: rec = json.load(open(os.path.join(JOBS_DIR, fn)))
-        except Exception: continue
-        was_live = rec.get("state") in ("queued", "running")
-        if was_live:
-            rec["state"] = "error"
-            rec["error"] = ("lost: the MCP server process restarted while this job was in "
-                            "flight (harness kill or Claude restart). Resubmit it.")
-            rec["ended"] = rec.get("ended") or time.time()
-        rec["event"] = threading.Event(); rec["event"].set()
-        JOBS[jid] = rec
-        if was_live: persist(jid)
 
-load_persisted()
+def validate_jid(jid):
+    if not isinstance(jid, str) or not re.fullmatch(r"[0-9a-f]{8,32}", jid):
+        raise ToolError("Invalid job_id; use the ID returned by qwen_submit.")
+    return jid
+
+
+def record_path(jid):
+    return os.path.join(JOBS_DIR, validate_jid(jid) + ".json")
+
+
+def ensure_owner(owner=OWNER):
+    # Called under registry(). A held file lock is the lease, not PID existence.
+    if owner not in OWNERS:
+        handle = open(os.path.join(JOBS_DIR, ".owner-" + owner + ".lock"), "a+b")
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            handle.close()
+            raise
+        OWNERS[owner] = handle
+
+
+def release_owner(owner):
+    # Release even if final persistence failed: a reader can then report an
+    # interrupted job instead of waiting forever on a healthy but idle process.
+    with REGISTRY_LOCK:
+        handle = OWNERS.pop(owner, None)
+        if handle is not None:
+            handle.close()
+            try:
+                os.unlink(os.path.join(JOBS_DIR, ".owner-" + owner + ".lock"))
+            except OSError:
+                pass
+
+
+def owner_alive(owner):
+    if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+        return False
+    if owner in OWNERS:
+        return True
+    try:
+        with open(os.path.join(JOBS_DIR, ".owner-" + owner + ".lock"), "r+b") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def read_record(jid):
+    try:
+        with open(record_path(jid), encoding="utf-8") as f:
+            rec = json.load(f)
+    except FileNotFoundError:
+        return None
+    if not isinstance(rec, dict):
+        raise ToolError("Saved job %s is not a valid record." % jid)
+    return rec
+
+
+def write_record(jid, rec):
+    # Caller holds registry(). A unique temporary file also avoids v1.2 temp names.
+    fd, tmp = tempfile.mkstemp(prefix="." + jid + "-", suffix=".tmp", dir=JOBS_DIR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, record_path(jid))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def recover_record(jid, rec):
+    if rec.get("state") in LIVE_STATES and not owner_alive(rec.get("owner")):
+        rec["state"] = "incomplete" if rec.get("answer") or rec.get("thinking_chars") else "error"
+        rec["ended"] = time.time()
+        rec["error"] = "Interrupted: the owning MCP process exited. Partial output is not a completed result; resubmit deliberately."
+        if not rec.get("owner"):
+            rec["error"] = ("Legacy v1.2 job has no recoverable owner. After a full Claude restart, "
+                            "resubmit it. If an old v1.2 process is still running, check that process first.")
+        write_record(jid, rec)
+    return rec
+
+
+def all_records(recover=False):
+    records = {}
+    for name in os.listdir(JOBS_DIR):
+        if not re.fullmatch(r"[0-9a-f]{8,32}\.json", name):
+            continue
+        jid = name[:-5]
+        try:
+            rec = read_record(jid)
+            if rec is not None:
+                records[jid] = recover_record(jid, rec) if recover else rec
+        except (ValueError, ToolError):
+            # Do not delete a malformed record or let it hide otherwise valid jobs.
+            continue
+    return records
+
+
+def completion_time(jid, rec):
+    value = rec.get("ended")
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return value
+    return os.path.getmtime(record_path(jid))
+
+
+def prune_records():
+    # Retain every live record and the newest 50 terminal records, by completion.
+    records = all_records()
+    terminal = [(completion_time(jid, rec), jid) for jid, rec in records.items()
+                if rec.get("state") in TERMINAL_STATES]
+    terminal.sort()
+    for _, jid in terminal[:-KEEP_RESULTS]:
+        os.unlink(record_path(jid))
+
+
+def persist(jid, rec, terminal=False):
+    with registry():
+        write_record(jid, rec)
+        if terminal:
+            prune_records()
+
+
+def get_job(jid):
+    validate_jid(jid)
+    with registry():
+        rec = read_record(jid)
+        if rec is None:
+            raise ToolError("Unknown or expired job_id: %s. The newest %d completed results are retained." % (jid, KEEP_RESULTS))
+        return recover_record(jid, rec)
+
 
 def http(path, body=None, timeout=8):
     headers = {"Authorization": "Bearer " + KEY}
@@ -78,156 +207,292 @@ def http(path, body=None, timeout=8):
     if body is not None:
         headers["Content-Type"] = "application/json"
         data = json.dumps(body).encode()
-    req = urllib.request.Request(BASE + path, data=data, headers=headers)
-    return urllib.request.urlopen(req, timeout=timeout)
+    return urllib.request.urlopen(urllib.request.Request(BASE + path, data=data, headers=headers), timeout=timeout)
 
-def est_tokens(s): return int(len(s) / 3.5) + 16
 
-def run_job(jid, body):
-    with ACTIVE:
-        j = JOBS[jid]
-        j["state"] = "running"
-        persist(jid)
+def est_tokens(s):
+    return int(len(s) / 3.5) + 16
+
+
+def sse_data(response):
+    parts = []
+    for raw in response:
+        line = raw.decode("utf-8").rstrip("\r\n")
+        if not line:
+            if parts:
+                yield "\n".join(parts)
+                parts = []
+        elif line.startswith("data:"):
+            value = line[5:]
+            parts.append(value[1:] if value.startswith(" ") else value)
+        # Comments, event names, IDs and retry hints do not carry model output.
+    # An event without its blank-line terminator is incomplete SSE, not success.
+    if parts:
+        raise ToolError("Interrupted SSE event at end of stream.")
+
+
+def error_message(exc):
+    if isinstance(exc, urllib.error.HTTPError):
         try:
-            body["stream"] = True
-            with http("/v1/chat/completions", body, timeout=3900) as r:
-                for raw in r:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line.startswith("data: "): continue
-                    payload = line[6:]
-                    if payload == "[DONE]": break
-                    try: ch = json.loads(payload)
-                    except ValueError: continue
-                    if ch.get("usage"): j["usage"] = ch["usage"]
-                    for c in ch.get("choices", []):
-                        d = c.get("delta", {})
-                        if d.get("reasoning_content"):
-                            j["thinking_chars"] += len(d["reasoning_content"]); j["phase"] = "thinking"
-                        if d.get("content"):
-                            j["answer"] += d["content"]; j["phase"] = "answering"
-                        if d.get("tool_calls"): j["phase"] = "tool_call?"
-                        if c.get("finish_reason"): j["finish"] = c["finish_reason"]
-            j["state"] = "done"
-        except Exception as e:
-            j["state"] = "error"; j["error"] = "%s: %s" % (type(e).__name__, e)
-        j["ended"] = time.time()
-        persist(jid)
-        j["event"].set()   # completion push: wake any qwen_status wait instantly
+            detail = exc.read(4096).decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        return "HTTP %s: %s" % (exc.code, detail or exc.reason)
+    return "%s: %s" % (type(exc).__name__, exc)
+
+
+def consume_stream(response, rec, checkpoint):
+    saw_done = False
+    saw_tools = False
+    for payload in sse_data(response):
+        if payload == "[DONE]":
+            saw_done = True
+            break
+        chunk = json.loads(payload)  # Malformed frames are failures, never skipped.
+        if not isinstance(chunk, dict):
+            raise ToolError("Malformed SSE JSON: expected an object.")
+        if "error" in chunk:
+            raise ToolError("NINFER stream error: " + json.dumps(chunk["error"], ensure_ascii=False))
+        if chunk.get("usage"):
+            rec["usage"] = chunk["usage"]
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("reasoning_content"):
+                rec["thinking_chars"] += len(delta["reasoning_content"])
+                rec["phase"] = "thinking"
+            if delta.get("content"):
+                rec["answer"] += delta["content"]
+                rec["phase"] = "answering"
+            if delta.get("tool_calls"):
+                saw_tools = True
+            if choice.get("finish_reason"):
+                rec["finish"] = choice["finish_reason"]
+        checkpoint()
+    if not saw_done:
+        raise ToolError("Interrupted stream: missing terminal [DONE].")
+    if not rec.get("finish"):
+        raise ToolError("Interrupted stream: missing finish_reason.")
+    if rec["finish"] == "length":
+        rec["state"] = "incomplete"
+        rec["error"] = "Output/context limit reached. The answer may be truncated; this job is not complete."
+    elif rec["finish"] != "stop" or saw_tools:
+        rec["state"] = "incomplete"
+        rec["error"] = "Unexpected finish/tool output (%s). This text-only MCP does not execute tools." % rec["finish"]
+    else:
+        rec["state"] = "done"
+
+
+def run_job(jid, body, rec):
+    try:
+        # flock is released by the OS even if Claude terminates this process.
+        with ACTIVE:
+            with open(os.path.join(JOBS_DIR, ".generation.lock"), "a+b") as slot:
+                fcntl.flock(slot, fcntl.LOCK_EX)
+                rec["state"] = "running"
+                rec["phase"] = "connecting"
+                persist(jid, rec)
+                last_saved = time.monotonic()
+
+                def checkpoint():
+                    nonlocal last_saved
+                    if time.monotonic() - last_saved >= SNAPSHOT_S:
+                        persist(jid, rec)
+                        last_saved = time.monotonic()
+
+                try:
+                    with http("/v1/chat/completions", body, timeout=3900) as response:
+                        consume_stream(response, rec, checkpoint)
+                finally:
+                    fcntl.flock(slot, fcntl.LOCK_UN)
+    except Exception as exc:
+        rec["state"] = "incomplete" if rec.get("answer") or rec.get("thinking_chars") else "error"
+        rec["error"] = error_message(exc)
+    rec["ended"] = time.time()
+    try:
+        persist(jid, rec, terminal=True)
+    except Exception as exc:
+        # Fail visibly instead of silently claiming the result was saved.
+        sys.stderr.write("qwen-local: could not persist terminal job %s: %s\n" % (jid, error_message(exc)))
+        sys.stderr.flush()
+    finally:
+        release_owner(rec.get("owner"))
+
+
+def start_job(task, body, effort):
+    jid = uuid.uuid4().hex
+    with registry():
+        ensure_owner(jid)
+        rec = {"state": "queued", "started": time.time(), "ended": None,
+               "phase": "queued", "task_preview": task[:120], "answer": "",
+               "thinking_chars": 0, "usage": None, "error": None, "finish": None,
+               "effort": effort, "owner": jid, "owner_pid": os.getpid(),
+               "bridge_version": VERSION}
+        try:
+            write_record(jid, rec)
+        except BaseException:
+            release_owner(jid)
+            raise
+    try:
+        threading.Thread(target=run_job, args=(jid, body, rec), daemon=True).start()
+    except Exception as exc:
+        rec.update(state="error", ended=time.time(), error=error_message(exc))
+        try:
+            persist(jid, rec, terminal=True)
+        finally:
+            release_owner(jid)
+        raise
+    return jid
+
+
+def wait_job(jid, seconds):
+    end = time.monotonic() + seconds
+    while True:
+        rec = get_job(jid)
+        remaining = end - time.monotonic()
+        if rec["state"] not in LIVE_STATES or remaining <= 0:
+            return rec
+        time.sleep(min(POLL_S, remaining))
+
 
 def t_health(args):
-    try:
-        m = json.loads(http("/v1/models", timeout=4).read().decode())
-        return ("UP -- model %s at %s, window %s tokens (qwen-local v1.2.0). Jobs: %s" %
-                (m["data"][0]["id"], BASE, format(WINDOW, ","),
-                 {k: v["state"] for k, v in JOBS.items()} or "none"))
-    except Exception as e:
-        return ("DOWN (%s). Ask the user to run START-NINFER.bat -- the server boots in ~10s." % e)
+    with http("/health", timeout=4) as r:
+        health = json.load(r)
+    if health.get("status") != "ok":
+        raise ToolError("NINFER is not ready: %s" % health)
+    with http("/v1/models", timeout=4) as r:
+        model = json.load(r)["data"][0]
+    with registry():
+        jobs = {jid: rec.get("state") for jid, rec in all_records(recover=True).items()}
+    window = model.get("max_model_len", WINDOW)
+    source = "server-reported" if "max_model_len" in model else "configured fallback"
+    return ("UP -- model %s at %s, window %s tokens (%s), qwen-local v%s. "
+            "MCP generations: 1 shared slot on this host. Jobs: %s" %
+            (model["id"], BASE, format(window, ","), source, VERSION, jobs or "none"))
+
+
+def nonempty_text(args, key):
+    value = args.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ToolError("%s must be a nonempty string." % key)
+    return value
+
+
+def check_payload(body):
+    size = len(json.dumps(body).encode())
+    if size > MAX_PAYLOAD_BYTES:
+        raise ToolError("Request body is %s bytes; limit %s. Trim context." % (size, MAX_PAYLOAD_BYTES))
+    return size
+
 
 def t_ask(args):
-    q = args["question"]; eff = args.get("effort", "low")
-    if eff not in ("none", "low"): return "effort for qwen_ask must be none|low (use qwen_submit for bigger)."
-    body = {"model": "qwen3.8-27b", "max_tokens": MAX_SYNC_TOKENS, "reasoning_effort": eff,
-            "messages": [{"role": "user", "content": q}]}
-    try:
-        r = json.loads(http("/v1/chat/completions", body, timeout=90).read().decode())
-        msg = r["choices"][0]["message"]
-        u = r.get("usage", {})
-        return (msg.get("content") or "") + "\n\n[usage: prompt %s, output %s, finish %s]" % (
-            u.get("prompt_tokens"), u.get("completion_tokens"), r["choices"][0].get("finish_reason"))
-    except Exception as e:
-        return "qwen_ask failed: %s -- if the server is down, ask the user to run START-NINFER.bat" % e
+    question = nonempty_text(args, "question")
+    effort = args.get("effort", "low")
+    if effort not in ("none", "low"):
+        raise ToolError("effort for qwen_ask must be none|low; use qwen_submit for bigger tasks.")
+    body = {"model": "qwen3.8-27b", "max_tokens": MAX_SYNC_TOKENS,
+            "reasoning_effort": effort, "messages": [{"role": "user", "content": question}],
+            "stream": True, "stream_options": {"include_usage": True}}
+    check_payload(body)
+    jid = start_job(question, body, effort)
+    rec = wait_job(jid, min(WAIT_DEFAULT_S, WAIT_MAX_S))
+    if rec["state"] in LIVE_STATES:
+        return ("Job %s is still %s; the quick-call wait ended cleanly. Do not resubmit. "
+                "Use qwen_status with wait:true, then qwen_result." % (jid, rec["state"]))
+    return render_result(jid, rec)
+
 
 def t_submit(args):
-    task = args["task"]; ctx = args.get("context", "")
-    eff = args.get("effort", "xhigh"); maxtok = int(args.get("max_tokens", 131_072))
+    task = nonempty_text(args, "task")
+    context = args.get("context", "")
     system = args.get("system", "")
-    cp = args.get("context_path")
-    if cp:
-        if not os.path.isabs(cp):
-            return "REJECTED: context_path must be an absolute path (got %r)." % cp
-        if not os.path.isfile(cp):
-            return "REJECTED: context_path does not exist or is not a file: %s" % cp
-        sz = os.path.getsize(cp)
-        if sz > MAX_PAYLOAD_BYTES:
-            return ("REJECTED: context_path file is %s bytes; the limit is %s bytes (2MB). "
-                    "Split the file or trim it." % (format(sz, ","), format(MAX_PAYLOAD_BYTES, ",")))
-        try:
-            file_ctx = open(cp, encoding="utf-8", errors="replace").read()
-        except Exception as e:
-            return "REJECTED: could not read context_path: %s: %s" % (type(e).__name__, e)
-        ctx = (ctx + "\n\n" if ctx else "") + file_ctx
-    content = task + (("\n\n--- CONTEXT ---\n" + ctx) if ctx else "")
-    budget = WINDOW - maxtok
-    need = est_tokens(content) + est_tokens(system)
-    if need > budget:
-        return ("REJECTED before sending: prompt ~%s tokens but only %s fit beside max_tokens=%s "
-                "(window %s). Trim context or lower max_tokens." %
-                (format(need, ","), format(budget, ","), format(maxtok, ","), format(WINDOW, ",")))
-    msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
-    body = {"model": "qwen3.8-27b", "max_tokens": maxtok, "reasoning_effort": eff,
-            "stream_options": {"include_usage": True}, "messages": msgs}
-    body_bytes = len(json.dumps(body).encode())
-    if body_bytes > MAX_PAYLOAD_BYTES:
-        return ("REJECTED before sending: request body is %s bytes; the limit is %s bytes (2MB, "
-                "matching the server's --max-request-mib 2). Trim context or use a smaller file." %
-                (format(body_bytes, ","), format(MAX_PAYLOAD_BYTES, ",")))
-    jid = uuid.uuid4().hex[:8]
-    with LOCK:
-        JOBS[jid] = {"state": "queued", "started": time.time(), "ended": None, "phase": "queued",
-                     "task_preview": task[:120], "answer": "", "thinking_chars": 0,
-                     "usage": None, "error": None, "finish": None, "effort": eff,
-                     "event": threading.Event()}
-    persist(jid)
-    threading.Thread(target=run_job, args=(jid, body), daemon=True).start()
+    if not isinstance(context, str) or not isinstance(system, str):
+        raise ToolError("context and system must be strings.")
+    effort = args.get("effort", "xhigh")
+    if effort not in ("none", "low", "medium", "xhigh"):
+        raise ToolError("effort must be none|low|medium|xhigh.")
+    max_tokens = args.get("max_tokens", 131_072)
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or not 0 < max_tokens < WINDOW:
+        raise ToolError("max_tokens must be a positive integer smaller than the context window.")
+    path = args.get("context_path")
+    if path:
+        if not isinstance(path, str) or not os.path.isabs(path) or not os.path.isfile(path):
+            raise ToolError("context_path must name an existing absolute file path.")
+        with open(path, "rb") as f:
+            data = f.read(MAX_PAYLOAD_BYTES + 1)
+        if len(data) > MAX_PAYLOAD_BYTES:
+            raise ToolError("context_path exceeds the 2,000,000-byte limit; trim the file.")
+        context += ("\n\n" if context else "") + data.decode("utf-8", "replace")
+    content = task + ("\n\n--- CONTEXT ---\n" + context if context else "")
+    needed = est_tokens(content) + est_tokens(system)
+    if needed > WINDOW - max_tokens:
+        raise ToolError("Estimated prompt %s exceeds the %s tokens available beside max_tokens=%s. Trim context." %
+                        (needed, WINDOW - max_tokens, max_tokens))
+    messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": content}]
+    body = {"model": "qwen3.8-27b", "max_tokens": max_tokens, "reasoning_effort": effort,
+            "stream": True, "stream_options": {"include_usage": True}, "messages": messages}
+    size = check_payload(body)
+    jid = start_job(task, body, effort)
     return ("Job %s submitted (effort=%s, max_tokens=%s, prompt ~%s tokens, body %s bytes). "
-            "Use qwen_status with wait:true to block until it finishes (chain waits for "
-            "multi-minute jobs); typical xhigh jobs think for 2-10 minutes." %
-            (jid, eff, format(maxtok, ","), format(need, ","), format(body_bytes, ",")))
+            "One MCP generation runs at a time across processes on this host. "
+            "Use qwen_status with wait:true; chain waits for long jobs." %
+            (jid, effort, format(max_tokens, ","), format(needed, ","), format(size, ",")))
 
-def status_payload(j, waited=None):
-    el = (j["ended"] or time.time()) - j["started"]
-    out = {"state": j["state"], "phase": j["phase"], "elapsed_s": round(el, 1),
-           "thinking_chars": j["thinking_chars"], "answer_chars": len(j["answer"]),
-           "finish": j["finish"], "error": j["error"], "task": j["task_preview"]}
-    if waited is not None:
-        out["waited_s"] = round(waited, 1)
-        if j["state"] in ("queued", "running"):
-            out["note"] = ("still running -- wait returned cleanly at the safety clamp; "
-                           "call qwen_status wait:true again (chained waits are the "
-                           "intended pattern for multi-minute jobs)")
-    return json.dumps(out)
 
 def t_status(args):
-    j = JOBS.get(args["job_id"])
-    if not j: return "unknown job_id. Known: %s" % list(JOBS)
-    if args.get("wait") and j["state"] in ("queued", "running"):
-        try: timeout = float(args.get("timeout_s", WAIT_DEFAULT_S))
-        except (TypeError, ValueError): timeout = WAIT_DEFAULT_S
-        timeout = max(1.0, min(timeout, WAIT_MAX_S))
-        t0 = time.time()
-        j["event"].wait(timeout)          # completion push: returns the instant the job ends
-        return status_payload(j, waited=time.time() - t0)
-    return status_payload(j)
+    jid = validate_jid(args.get("job_id"))
+    started = time.monotonic()
+    if args.get("wait"):
+        try:
+            seconds = float(args.get("timeout_s", WAIT_DEFAULT_S))
+            if not math.isfinite(seconds):
+                seconds = WAIT_DEFAULT_S
+        except (TypeError, ValueError):
+            seconds = WAIT_DEFAULT_S
+        rec = wait_job(jid, max(0.0, min(seconds, WAIT_MAX_S)))
+    else:
+        rec = get_job(jid)
+    payload = {"job_id": jid, "state": rec["state"], "phase": rec.get("phase"),
+               "elapsed_s": round((rec.get("ended") or time.time()) - rec["started"], 1),
+               "thinking_chars": rec.get("thinking_chars", 0), "answer_chars": len(rec.get("answer", "")),
+               "finish": rec.get("finish"), "error": rec.get("error"), "task": rec.get("task_preview", "")}
+    if args.get("wait"):
+        payload["waited_s"] = round(time.monotonic() - started, 1)
+        if rec["state"] in LIVE_STATES:
+            payload["note"] = "Still running/queued; call qwen_status wait:true again. Do not resubmit."
+    text = json.dumps(payload)
+    if rec["state"] in ("error", "incomplete", "cancelled"):
+        raise ToolError(text)
+    return text
+
+
+def render_result(jid, rec):
+    if rec["state"] in LIVE_STATES:
+        return "Job %s is %s. Use qwen_status wait:true, then qwen_result." % (jid, rec["state"])
+    usage = rec.get("usage") or {}
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    meta = "\n\n[job=%s | state=%s | finish=%s | prompt=%s (cached %s) | output=%s | %.0fs]" % (
+        jid, rec["state"], rec.get("finish"), usage.get("prompt_tokens"), cached,
+        usage.get("completion_tokens"), (rec.get("ended") or time.time()) - rec["started"])
+    text = (rec.get("answer") or "") + meta
+    if rec["state"] != "done":
+        raise ToolError("JOB %s: %s\n\nPARTIAL OUTPUT (not a completed result):\n%s" %
+                        (rec["state"].upper(), rec.get("error") or "No completion confirmation", text))
+    return text
+
 
 def t_result(args):
-    j = JOBS.get(args["job_id"])
-    if not j: return "unknown job_id. Known: %s" % list(JOBS)
-    if j["state"] in ("queued", "running"):
-        return "not finished (state=%s, phase=%s). Use qwen_status with wait:true to block until done." % (j["state"], j["phase"])
-    if j["state"] == "error": return "job failed: %s" % j["error"]
-    out = j["answer"]
-    u = j["usage"] or {}
-    ptd = (u.get("prompt_tokens_details") or {}).get("cached_tokens")
-    meta = "\n\n[finish=%s | prompt=%s (cached %s) | output=%s | %.0fs]" % (
-        j["finish"], u.get("prompt_tokens"), ptd, u.get("completion_tokens"),
-        (j["ended"] or time.time()) - j["started"])
-    if args.get("include_thinking"): meta += " [thinking omitted: %d chars streamed]" % j["thinking_chars"]
-    return out + meta
+    jid = validate_jid(args.get("job_id"))
+    rec = get_job(jid)
+    text = render_result(jid, rec)
+    if args.get("include_thinking"):
+        text += " [thinking omitted: %d chars streamed]" % rec.get("thinking_chars", 0)
+    return text
+
 
 TOOLS = [
  dict(name="qwen_health", description="Check the local Qwen3.8-27B server (ninfer :8080): up/down, model, window, running jobs.",
       inputSchema={"type": "object", "properties": {}, "required": []}),
- dict(name="qwen_ask", description="Quick synchronous question to local Qwen (effort none|low, <=4K output, seconds). For implementation tasks use qwen_submit.",
+ dict(name="qwen_ask", description="Quick question to local Qwen (effort none|low, <=4K output). Shares the one-job queue; returns a job_id if not finished within 45 seconds. Do not resubmit; use qwen_status/qwen_result. For implementation tasks use qwen_submit.",
       inputSchema={"type": "object", "properties": {"question": {"type": "string"}, "effort": {"type": "string", "enum": ["none", "low"]}}, "required": ["question"]}),
  dict(name="qwen_submit", description="Delegate a bounded task (coding implementation, refactor, tests, summarization) to local Qwen as a background job at reasoning_effort xhigh by default. Write a SELF-CONTAINED spec: goal, constraints, interfaces; put needed file contents in context, or point context_path at a local file the MCP will read and inline (<=2MB; avoids pasting huge strings through tool parameters). Returns a job_id immediately. Then chain qwen_status wait:true calls until completion -- no polling loops.",
       inputSchema={"type": "object", "properties": {
@@ -238,7 +503,7 @@ TOOLS = [
           "effort": {"type": "string", "enum": ["none", "low", "medium", "xhigh"]},
           "max_tokens": {"type": "integer", "description": "output budget, default 131072 (thinking+answer)"}},
           "required": ["task"]}),
- dict(name="qwen_status", description="Progress of a qwen_submit job. Default: instant snapshot (state, phase thinking/answering, elapsed, sizes). With wait:true it BLOCKS until the job reaches done/error or timeout_s elapses (default 45, hard-clamped to 50 so the MCP harness never kills the server process), then returns the same payload -- a clean 'still running' note at the clamp, never an error. For multi-minute jobs CHAIN wait calls back-to-back: each is one turn, waking fires within ~1s of actual completion, no sleep-timer math needed. Other tool calls are not blocked while waiting. Finished results persist to disk and survive MCP restarts.",
+ dict(name="qwen_status", description="Progress of a qwen_submit job. Default: instant snapshot (state, phase thinking/answering, elapsed, sizes). With wait:true it BLOCKS until the job reaches done/error/incomplete or timeout_s elapses (default 45, hard-clamped to 50 so the MCP harness never kills the server process), then returns the same payload -- a clean 'still running' note at the clamp, never an error. For multi-minute jobs CHAIN wait calls back-to-back: each is one turn, waking fires within ~1s of actual completion, no sleep-timer math needed. Other tool calls are not blocked while waiting. Jobs are shared across local MCP processes. The newest 50 terminal results persist across restarts; incomplete/failed jobs are reported as errors.",
       inputSchema={"type": "object", "properties": {"job_id": {"type": "string"},
           "wait": {"type": "boolean", "description": "block until done/error or timeout_s"},
           "timeout_s": {"type": "number", "description": "max seconds to block (default 45, clamped to 50 -- chain calls for longer jobs)"}},
@@ -249,41 +514,68 @@ TOOLS = [
 HANDLERS = {"qwen_health": t_health, "qwen_ask": t_ask, "qwen_submit": t_submit,
             "qwen_status": t_status, "qwen_result": t_result}
 
+
 def reply(mid, result=None, error=None):
     msg = {"jsonrpc": "2.0", "id": mid}
-    if error: msg["error"] = {"code": -32000, "message": error}
-    else: msg["result"] = result
+    if error:
+        msg["error"] = {"code": -32000, "message": error}
+    else:
+        msg["result"] = result
     with OUT_LOCK:
-        sys.stdout.write(json.dumps(msg) + "\n"); sys.stdout.flush()
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
 
 def handle_call(mid, name, args):
+    if not isinstance(name, str):
+        reply(mid, error="tool name must be a string")
+        return
     fn = HANDLERS.get(name)
-    if not fn:
-        reply(mid, error="unknown tool " + name); return
-    try: text = fn(args)
-    except Exception as e: text = "%s failed: %s" % (name, e)
-    reply(mid, {"content": [{"type": "text", "text": text}], "isError": False})
+    if fn is None:
+        reply(mid, error="unknown tool " + str(name))
+        return
+    failed = False
+    try:
+        if not isinstance(args, dict):
+            raise ToolError("Tool arguments must be an object.")
+        text = fn(args)
+    except Exception as exc:
+        failed = True
+        text = str(exc) if isinstance(exc, ToolError) else error_message(exc)
+    reply(mid, {"content": [{"type": "text", "text": text}], "isError": failed})
+
 
 def main():
     for raw in sys.stdin:
-        raw = raw.strip()
-        if not raw: continue
-        try: m = json.loads(raw)
-        except ValueError: continue
-        meth, mid = m.get("method"), m.get("id")
-        if meth == "initialize":
-            reply(mid, {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"),
+        try:
+            message = json.loads(raw)
+            if not isinstance(message, dict):
+                continue
+        except ValueError:
+            continue
+        method, mid = message.get("method"), message.get("id")
+        params = message.get("params") or {}
+        if not isinstance(params, dict):
+            if mid is not None:
+                reply(mid, error="params must be an object")
+            continue
+        if method == "initialize":
+            reply(mid, {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "qwen-local", "version": "1.2.0"}})
-        elif meth == "notifications/initialized": continue
-        elif meth == "ping": reply(mid, {})
-        elif meth == "tools/list": reply(mid, {"tools": TOOLS})
-        elif meth == "tools/call":
-            name = m["params"]["name"]; args = m["params"].get("arguments") or {}
-            # worker thread per call: a blocking wait must never stall other tool calls
-            threading.Thread(target=handle_call, args=(mid, name, args), daemon=True).start()
+                        "serverInfo": {"name": "qwen-local", "version": VERSION}})
+        elif method == "notifications/initialized":
+            continue
+        elif method == "ping":
+            reply(mid, {})
+        elif method == "tools/list":
+            reply(mid, {"tools": TOOLS})
+        elif method == "tools/call":
+            threading.Thread(target=handle_call,
+                             args=(mid, params.get("name"), params.get("arguments", {})),
+                             daemon=True).start()
         elif mid is not None:
-            reply(mid, error="unsupported method " + str(meth))
+            reply(mid, error="unsupported method " + str(method))
+
 
 if __name__ == "__main__":
     main()
